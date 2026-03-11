@@ -487,8 +487,12 @@ class ToolExecutor:
         # Route through sandbox if available
         if self._sandbox_exec is not None:
             try:
+                # Prepend cd if workdir is specified
+                cmd = params.command
+                if params.workdir:
+                    cmd = f"cd {params.workdir} && {cmd}"
                 exit_code, output = await self._sandbox_exec(
-                    params.command, params.timeout,
+                    cmd, params.timeout,
                 )
                 return ToolResult(
                     success=exit_code == 0,

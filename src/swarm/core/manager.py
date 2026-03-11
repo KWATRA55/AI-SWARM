@@ -56,6 +56,9 @@ class SwarmManager:
     # If an agent hasn't progressed in this many seconds, nudge it
     STALL_THRESHOLD = 30
 
+    # Stop nudging after this many attempts (agent is truly stuck)
+    MAX_NUDGES = 10
+
     # Minimum iterations a peer must have before we consider it "ahead"
     HELPER_DISPATCH_MIN_ITERATIONS = 5
 
@@ -153,9 +156,13 @@ class SwarmManager:
         now = time.time()
 
         for name, agent in snapshot.agents.items():
-            if agent.status != AgentStatus.RUNNING:
+            if agent.status in (AgentStatus.COMPLETED, AgentStatus.FAILED,
+                                AgentStatus.IDLE, AgentStatus.INTERRUPTED):
                 if agent.status == AgentStatus.COMPLETED:
                     self._completed_agents.add(name)
+                # Clean up tracking for finished agents
+                self._last_progress.pop(name, None)
+                self._nudge_count.pop(name, None)
                 continue
 
             current_iters = agent.iterations
@@ -178,6 +185,23 @@ class SwarmManager:
                 if stall_duration > self.STALL_THRESHOLD:
                     nudge_num = self._nudge_count.get(name, 0) + 1
                     self._nudge_count[name] = nudge_num
+
+                    # Stop nudging after MAX_NUDGES — agent is truly stuck
+                    if nudge_num > self.MAX_NUDGES:
+                        await logger.warning(
+                            "manager.agent_stuck_giving_up",
+                            agent=name,
+                            nudges=nudge_num,
+                            msg="Max nudges reached, stopping monitoring.",
+                        )
+                        await self._broadcast("agent_stuck", {
+                            "agent": name,
+                            "nudges": nudge_num,
+                            "message": f"Agent {name} stuck after {nudge_num} nudges — stopped monitoring.",
+                        })
+                        # Remove from tracking so we stop checking
+                        self._last_progress.pop(name, None)
+                        continue
 
                     await logger.warning(
                         "manager.agent_stalled",

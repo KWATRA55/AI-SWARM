@@ -98,10 +98,10 @@ body {
 }
 .folder-btn:hover { border-color: var(--accent-blue); color: var(--text-primary); }
 
-/* ===== MAIN LAYOUT ===== */
+/* ===== MAIN LAYOUT — CHAT CENTERED ===== */
 .main {
   display: grid;
-  grid-template-columns: 1fr 1fr 360px;
+  grid-template-columns: 320px 1fr 320px;
   grid-template-rows: auto 1fr;
   gap: 10px; padding: 10px 16px;
   height: calc(100vh - 52px);
@@ -199,40 +199,77 @@ body {
 .file-row { padding: 3px 6px; border-radius: 4px; display: flex; align-items: center; gap: 5px; font-size: 10px; cursor: default; transition: background 0.15s; }
 .file-row:hover { background: var(--bg-card-hover); }
 
-/* ===== CHAT PANEL ===== */
+/* ===== CHAT PANEL (CENTER — MAIN) ===== */
 .chat-panel {
   display: flex; flex-direction: column; background: var(--bg-card);
   border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
-  grid-row: 1 / 3;
+  grid-row: 2 / 3;
 }
 .chat-header {
-  padding: 10px 14px; border-bottom: 1px solid var(--border);
-  font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px;
-  background: linear-gradient(135deg, rgba(139, 92, 246, 0.08), rgba(59, 130, 246, 0.08));
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px;
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.1), rgba(59, 130, 246, 0.1));
   flex-shrink: 0;
 }
-.chat-header .model-tag { margin-left: auto; font-size: 9px; color: var(--accent-purple); background: rgba(139, 92, 246, 0.1); padding: 2px 8px; border-radius: 10px; font-family: 'JetBrains Mono'; }
-.chat-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.chat-header .model-tag { margin-left: auto; font-size: 10px; color: var(--accent-purple); background: rgba(139, 92, 246, 0.12); padding: 3px 10px; border-radius: 10px; font-family: 'JetBrains Mono'; }
+.chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 
-.chat-msg { max-width: 92%; padding: 10px 14px; border-radius: 12px; font-size: 12px; line-height: 1.6; word-break: break-word; white-space: pre-wrap; }
+.chat-msg { max-width: 85%; padding: 12px 16px; border-radius: 14px; font-size: 13px; line-height: 1.7; word-break: break-word; white-space: pre-wrap; }
 .chat-msg.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent-blue), #2563eb); color: white; border-bottom-right-radius: 4px; }
 .chat-msg.manager { align-self: flex-start; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
-.chat-msg.system-msg { align-self: center; background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border: 1px solid rgba(239, 68, 68, 0.2); font-size: 11px; text-align: center; border-radius: 8px; }
+.chat-msg.system-msg { align-self: center; background: rgba(239, 68, 68, 0.1); color: var(--accent-red); border: 1px solid rgba(239, 68, 68, 0.2); font-size: 11px; text-align: center; border-radius: 8px; max-width: 100%; }
+.chat-msg.status-update { align-self: center; background: rgba(59, 130, 246, 0.08); color: var(--accent-cyan); border: 1px solid rgba(6, 182, 212, 0.15); font-size: 11px; text-align: center; border-radius: 8px; max-width: 100%; font-family: 'JetBrains Mono'; padding: 8px 14px; }
 
-.chat-input-area { padding: 10px; border-top: 1px solid var(--border); display: flex; gap: 6px; background: rgba(0,0,0,0.2); flex-shrink: 0; }
+.typing-indicator { align-self: flex-start; color: var(--text-muted); font-size: 12px; padding: 8px 14px; animation: pulse 1.5s infinite; }
+
+.chat-input-area { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; background: rgba(0,0,0,0.25); flex-shrink: 0; }
 .chat-input {
-  flex: 1; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border);
-  background: var(--bg-input); color: var(--text-primary); font-size: 12px;
-  font-family: 'Inter'; resize: none; outline: none; min-height: 40px; max-height: 120px;
+  flex: 1; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--border);
+  background: var(--bg-input); color: var(--text-primary); font-size: 13px;
+  font-family: 'Inter'; resize: none; outline: none; min-height: 44px; max-height: 140px;
 }
-.chat-input:focus { border-color: var(--accent-purple); box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.1); }
+.chat-input:focus { border-color: var(--accent-purple); box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12); }
+.chat-input::placeholder { color: var(--text-muted); }
 .chat-send {
-  padding: 10px 16px; border-radius: 10px; border: none;
+  padding: 12px 20px; border-radius: 12px; border: none;
   background: linear-gradient(135deg, var(--accent-purple), var(--accent-blue));
-  color: white; font-size: 12px; cursor: pointer; font-family: 'Inter';
+  color: white; font-size: 14px; cursor: pointer; font-family: 'Inter';
   font-weight: 600; transition: all 0.2s; align-self: flex-end;
 }
-.chat-send:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3); }
+.chat-send:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(139, 92, 246, 0.35); }
+
+/* ===== LEFT PANEL: Events + Files stacked ===== */
+.left-stack { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.left-stack .panel { flex: 1; min-height: 0; }
+
+/* ===== RIGHT PANEL: Analytics + Status ===== */
+.right-stack { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.right-stack .panel { flex: 1; min-height: 0; }
+
+/* Mini analytics cards */
+.mini-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 8px; }
+.mini-stat { background: var(--bg-primary); border-radius: 8px; padding: 8px 10px; text-align: center; border: 1px solid var(--border); }
+.mini-stat .val { font-size: 18px; font-weight: 700; font-family: 'JetBrains Mono'; }
+.mini-stat .lbl { font-size: 9px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+.mini-stat.blue .val { color: var(--accent-blue); }
+.mini-stat.green .val { color: var(--accent-green); }
+.mini-stat.purple .val { color: var(--accent-purple); }
+.mini-stat.amber .val { color: var(--accent-amber); }
+
+/* Agent status list in right panel */
+.agent-status-list { padding: 6px; }
+.agent-status-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: 6px; font-size: 11px; transition: background 0.15s;
+}
+.agent-status-row:hover { background: var(--bg-card-hover); }
+.agent-status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.agent-status-dot.running { background: var(--accent-blue); box-shadow: 0 0 6px var(--accent-blue); }
+.agent-status-dot.completed { background: var(--accent-green); }
+.agent-status-dot.failed { background: var(--accent-red); }
+.agent-status-dot.idle { background: var(--accent-amber); }
+.agent-status-name { font-weight: 500; flex: 1; }
+.agent-status-info { font-family: 'JetBrains Mono'; font-size: 9px; color: var(--text-muted); }
 
 /* ===== CONFIG MODAL ===== */
 .modal-overlay {
@@ -270,32 +307,9 @@ body {
 .btn-cancel { padding: 8px 20px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text-secondary); cursor: pointer; font-family: 'Inter'; font-size: 13px; }
 .btn-danger { padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(239,68,68,0.3); background: rgba(239,68,68,0.1); color: var(--accent-red); cursor: pointer; font-family: 'Inter'; font-size: 11px; }
 
-/* ===== FOLDER MODAL ===== */
+/* Folder modal */
 .folder-modal .modal { width: 480px; }
 .folder-path-input { font-family: 'JetBrains Mono' !important; font-size: 12px !important; }
-
-/* ===== ANALYTICS VIEW ===== */
-.analytics-view { display: none; grid-column: 1 / 3; overflow-y: auto; padding: 4px; }
-.analytics-view.active { display: block; }
-.analytics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
-.stat-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; text-align: center; }
-.stat-value { font-size: 26px; font-weight: 700; font-family: 'JetBrains Mono'; }
-.stat-label { font-size: 10px; color: var(--text-muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
-.stat-card.blue .stat-value { color: var(--accent-blue); }
-.stat-card.green .stat-value { color: var(--accent-green); }
-.stat-card.purple .stat-value { color: var(--accent-purple); }
-.stat-card.amber .stat-value { color: var(--accent-amber); }
-
-.analytics-table { width: 100%; border-collapse: collapse; font-size: 11px; background: var(--bg-card); border-radius: 10px; overflow: hidden; border: 1px solid var(--border); margin-bottom: 14px; }
-.analytics-table th { padding: 8px 10px; text-align: left; font-size: 10px; text-transform: uppercase; color: var(--text-muted); background: rgba(255,255,255,0.02); border-bottom: 1px solid var(--border); }
-.analytics-table td { padding: 6px 10px; border-bottom: 1px solid rgba(45,55,72,0.4); font-family: 'JetBrains Mono'; font-size: 10px; }
-.analytics-table tr:hover td { background: rgba(255,255,255,0.015); }
-
-/* ===== SESSION PANEL (in analytics) ===== */
-.session-bar { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
-.session-chip { padding: 4px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-card); font-size: 10px; cursor: pointer; font-family: 'JetBrains Mono'; color: var(--text-secondary); transition: all 0.2s; }
-.session-chip.active { border-color: var(--accent-blue); color: var(--accent-blue); background: rgba(59,130,246,0.08); }
-.session-chip:hover { border-color: var(--accent-blue); }
 
 /* ===== SCROLLBAR ===== */
 ::-webkit-scrollbar { width: 4px; height: 4px; }
@@ -339,42 +353,61 @@ body {
     <div style="padding:14px;color:var(--text-muted);font-size:12px">Waiting for agents...</div>
   </div>
 
-  <!-- Left: Live Events -->
-  <div class="panel" id="eventPanel">
-    <div class="panel-header">📡 Live Events <span class="count" id="evtCount">0</span></div>
-    <div class="panel-body" id="eventLog"></div>
+  <!-- LEFT: Events + Files stacked -->
+  <div class="left-stack" id="leftStack" style="grid-column:1">
+    <div class="panel" id="eventPanel" style="flex:2">
+      <div class="panel-header">📡 Live Events <span class="count" id="evtCount">0</span></div>
+      <div class="panel-body" id="eventLog"></div>
+    </div>
+    <div class="panel" id="filePanel" style="flex:1">
+      <div class="panel-header">📁 File Changes <span class="count" id="fileCount">0</span></div>
+      <div class="panel-body" id="fileLog"></div>
+    </div>
   </div>
 
-  <!-- Middle: Files -->
-  <div class="panel" id="filePanel">
-    <div class="panel-header">📁 File Changes <span class="count" id="fileCount">0</span></div>
-    <div class="panel-body" id="fileLog"></div>
-  </div>
-
-  <!-- Analytics View (hidden) -->
-  <div class="analytics-view" id="analyticsView">
-    <div id="analyticsCont"><p style="color:var(--text-muted);text-align:center;padding:30px">Run the swarm to see analytics</p></div>
-  </div>
-
-  <!-- Right: Chat Panel -->
-  <div class="chat-panel" id="chatPanel">
+  <!-- CENTER: Chat Panel (MAIN) -->
+  <div class="chat-panel" id="chatPanel" style="grid-column:2">
     <div class="chat-header">
-      💬 Manager Chat
-      <span class="model-tag">Pro Model</span>
+      🧠 Manager Chat
+      <span class="model-tag">Architect · Pro Model</span>
     </div>
     <div class="chat-messages" id="chatMsgs">
-      <div class="chat-msg manager">👋 I'm your Manager (Pro Model). I can:
-• Scan and analyze the codebase
-• Suggest improvements & bug fixes
-• Dispatch tasks to any agent
-• Control the swarm (pause, resume, kill)
+      <div class="chat-msg manager">👋 I'm your Manager (Architect). I'm in charge of the swarm.
 
-What would you like me to work on?</div>
+I'll proactively:
+• Monitor all agents and report their status
+• Flag errors and suggest fixes
+• Dispatch and coordinate tasks across the team
+
+Tell me what to build, test, or fix — I'll handle the rest.</div>
     </div>
     <div class="chat-input-area">
-      <textarea class="chat-input" id="chatInput" placeholder="Message the Manager..." rows="1"
+      <textarea class="chat-input" id="chatInput" placeholder="Tell the manager what to do..." rows="1"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat();}"></textarea>
-      <button class="chat-send" onclick="sendChat()">→</button>
+      <button class="chat-send" onclick="sendChat()">Send →</button>
+    </div>
+  </div>
+
+  <!-- RIGHT: Analytics + Agent Status -->
+  <div class="right-stack" id="rightStack" style="grid-column:3">
+    <div class="panel" style="flex:0 0 auto">
+      <div class="panel-header">📊 Live Metrics</div>
+      <div class="mini-stats" id="miniStats">
+        <div class="mini-stat blue"><div class="val" id="mTokens">0</div><div class="lbl">Tokens</div></div>
+        <div class="mini-stat green"><div class="val" id="mFiles">0</div><div class="lbl">Files</div></div>
+        <div class="mini-stat purple"><div class="val" id="mTools">0</div><div class="lbl">Tools</div></div>
+        <div class="mini-stat amber"><div class="val" id="mIters">0</div><div class="lbl">Iterations</div></div>
+      </div>
+    </div>
+    <div class="panel" style="flex:1">
+      <div class="panel-header">🤖 Agent Status</div>
+      <div class="panel-body agent-status-list" id="agentStatusList">
+        <div style="padding:10px;color:var(--text-muted);font-size:11px">Waiting for agents...</div>
+      </div>
+    </div>
+    <div class="panel" style="flex:1">
+      <div class="panel-header">📋 Activity Log <span class="count" id="activityCount">0</span></div>
+      <div class="panel-body" id="activityLog"></div>
     </div>
   </div>
 </div>
@@ -438,12 +471,7 @@ What would you like me to work on?</div>
       </div>
       <p style="font-size:11px;color:var(--text-muted);margin-top:-8px">
         Enter the absolute path to the project folder the swarm should work on.
-        The swarm will read/write files in this directory.
       </p>
-      <div class="form-group" style="margin-top:14px">
-        <label>Sessions on this workspace</label>
-        <div id="sessionsList" style="font-size:11px;color:var(--text-muted)">No sessions yet</div>
-      </div>
     </div>
     <div class="modal-footer">
       <div></div>
@@ -459,6 +487,7 @@ What would you like me to work on?</div>
 const WS_URL = `ws://${location.host}/ws`;
 let ws = null;
 let evtCount = 0;
+let activityCount = 0;
 let startTime = Date.now();
 let agents = {};
 let files = {};
@@ -466,14 +495,13 @@ let view = 'live';
 let editAgent = null;
 let killed = false;
 let allPaused = false;
-let sessionData = [];  // Store sessions
-let currentSession = { id: Date.now().toString(36), events: [], start: Date.now() };
 
 // Timer
 setInterval(() => {
   const s = Math.floor((Date.now() - startTime) / 1000);
   document.getElementById('timer').textContent =
     `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  updateMiniStats();
 }, 1000);
 
 function connect() {
@@ -496,7 +524,6 @@ function handleEvent(event) {
   evtCount++;
   document.getElementById('evtCounter').textContent = `${evtCount} events`;
   document.getElementById('evtCount').textContent = evtCount;
-  currentSession.events.push(event);
 
   const type = event.type || '';
   const data = event.data || {};
@@ -504,47 +531,77 @@ function handleEvent(event) {
 
   // ── Agent tracking ──
   if (data.agent) {
-    if (!agents[data.agent]) agents[data.agent] = { name: data.agent, status: 'idle', iter: 0, tokens: 0, model: '', tools: 0, filesW: 0, filesR: 0 };
+    if (!agents[data.agent]) agents[data.agent] = { name: data.agent, status: 'idle', iter: 0, tokens: 0, model: '', tools: 0, filesW: 0, filesR: 0, lastActivity: '' };
     const a = agents[data.agent];
-    if (type === 'agent_started') { a.status = 'running'; a.model = data.model || a.model; }
-    else if (type === 'agent_completed') { a.status = 'completed'; }
-    else if (type === 'agent_failed' || type.includes('failed')) { a.status = 'failed'; }
-    else if (type === 'agent_paused') { a.status = 'paused'; }
-    else if (type === 'agent_resumed') { a.status = 'running'; }
-    // KEY FIX: update metrics from llm_call events
+    if (type === 'agent_started') { a.status = 'running'; a.model = data.model || a.model; a.lastActivity = 'Started'; }
+    else if (type === 'agent_completed' || type === 'dynamic_task_completed') { a.status = 'completed'; a.lastActivity = 'Completed'; }
+    else if (type === 'agent_failed' || type === 'dynamic_task_failed' || type.includes('failed')) { a.status = 'failed'; a.lastActivity = 'Failed'; }
+    else if (type === 'agent_paused') { a.status = 'paused'; a.lastActivity = 'Paused'; }
+    else if (type === 'agent_resumed') { a.status = 'running'; a.lastActivity = 'Resumed'; }
+
     if (type === 'llm_call') {
       a.iter = data.iterations || data.iteration || a.iter;
       a.tokens = data.tokens || a.tokens;
       a.tools = data.tools || a.tools;
       a.filesW = data.files_written || a.filesW;
       a.filesR = data.files_read || a.filesR;
+      a.lastActivity = `Iter ${a.iter}`;
     }
     if (type === 'tool_executed') { a.tools = data.tools || (a.tools + 1); }
+    if (type === 'tool_call') { a.lastActivity = `🔧 ${data.tool || ''}`.substring(0, 30); }
   }
 
   // Helper
   if (type === 'helper_dispatched' && data.idle_agent) {
-    if (!agents[data.idle_agent]) agents[data.idle_agent] = { name: data.idle_agent, status: 'idle', iter: 0, tokens: 0, model: '', tools: 0, filesW: 0, filesR: 0 };
+    if (!agents[data.idle_agent]) agents[data.idle_agent] = { name: data.idle_agent, status: 'idle', iter: 0, tokens: 0, model: '', tools: 0, filesW: 0, filesR: 0, lastActivity: '' };
     agents[data.idle_agent].status = 'helping';
+    agents[data.idle_agent].lastActivity = `Helping ${data.helping}`;
   }
 
-  // Chat
-  if (type === 'chat_message') { addChat(data.role || 'manager', data.message || ''); }
-  if (type === 'chat_typing') { /* typing indicator */ }
+  // Waiting for input (interactive mode)
+  if (type === 'waiting_for_input') {
+    addChat('status-update', `🧠 Interactive mode — ${(data.agents||[]).length} agents ready. Tell me what to do.`);
+  }
 
-  // Kill / run complete → fetch analytics
+  // Chat messages
+  if (type === 'chat_message') { addChat(data.role || 'manager', data.message || ''); }
+  if (type === 'chat_typing') { showTyping(); }
+
+  // Agent status changes → auto-report in chat
+  if (type === 'dynamic_task_completed') {
+    addChat('status-update', `✅ ${data.agent} completed their task`);
+  }
+  if (type === 'dynamic_task_failed') {
+    addChat('status-update', `❌ ${data.agent} failed: ${trunc(data.error||'unknown',60)}`);
+  }
+  if (type === 'task_dispatched') {
+    addChat('status-update', `🚀 Task dispatched to ${data.agent}`);
+  }
+  if (type === 'agent_stalled') {
+    addChat('status-update', `⚠️ ${data.agent} stalled (${data.stall_seconds}s, nudge #${data.nudge_number})`);
+  }
+  if (type === 'agent_stuck') {
+    addChat('status-update', `🛑 ${data.agent} stuck — stopped monitoring`);
+  }
+
+  // Kill / run complete
   if (type === 'kill_switch_triggered' || type === 'run_completed') {
     killed = true;
     document.getElementById('killBtn').classList.add('killed');
     document.getElementById('killBtn').textContent = '✓ KILLED';
-    // Save session
-    currentSession.end = Date.now();
-    sessionData.push({...currentSession, agents: {...agents}});
-    try { localStorage.setItem('swarm_sessions', JSON.stringify(sessionData)); } catch(e) {}
-    setTimeout(fetchAnalytics, 500);
   }
 
-  // Log formatting
+  // ── Activity log (key actions only) ──
+  const activityTypes = ['agent_started','agent_completed','dynamic_task_completed','dynamic_task_failed',
+    'task_dispatched','agent_stalled','agent_stuck','helper_dispatched','file_write',
+    'kill_switch_triggered','config_updated','tool_call'];
+  if (activityTypes.includes(type)) {
+    activityCount++;
+    document.getElementById('activityCount').textContent = activityCount;
+    addActivity(src, type, data);
+  }
+
+  // ── Event log formatting ──
   const fmt = {
     'infrastructure_ready': () => '🏗️ Infrastructure ready',
     'dag_resolved': () => `📊 DAG: ${JSON.stringify(data.tiers||[])}`,
@@ -553,9 +610,11 @@ function handleEvent(event) {
     'kill_switch_triggered': () => '🛑 KILL SWITCH ACTIVATED',
     'tier_started': () => `🏁 Tier ${data.tier}: ${(data.agents||[]).join(', ')}`,
     'manager_started': () => '🧠 Manager watchdog active',
+    'waiting_for_input': () => `🧑‍💻 Interactive mode — waiting for chat`,
     'agent_started': () => `▶️ Started (${data.model||''})`,
     'agent_completed': () => `✅ Done (${data.elapsed||'?'}s)`,
     'agent_stalled': () => `⚠️ STALLED ${data.stall_seconds}s (nudge #${data.nudge_number})`,
+    'agent_stuck': () => `🛑 ${data.agent} stuck (${data.nudges} nudges)`,
     'helper_dispatched': () => `🤝 ${data.idle_agent} → helping ${data.helping}`,
     'agent_paused': () => '⏸️ Paused',
     'agent_resumed': () => '▶️ Resumed',
@@ -568,14 +627,16 @@ function handleEvent(event) {
     'config_updated': () => `⚙️ Config: ${(data.updates||[]).join(', ')}`,
     'task_dispatched': () => `🚀 → ${data.agent}: ${trunc(data.task||'',50)}`,
     'dynamic_task_completed': () => `✅ Dynamic task done: ${data.agent}`,
+    'dynamic_task_failed': () => `❌ Dynamic task failed: ${data.agent} — ${trunc(data.error||'',40)}`,
     'error': () => `❌ ${trunc(data.error||data.message||'',80)}`,
   };
 
   const f = fmt[type];
   if (f) addEvt(src, f());
-  else if (!['chat_message','chat_typing','metrics_update'].includes(type)) addEvt(src, `${type}: ${trunc(JSON.stringify(data),60)}`);
+  else if (!['chat_message','chat_typing','metrics_update','response'].includes(type)) addEvt(src, `${type}: ${trunc(JSON.stringify(data),60)}`);
 
   renderAgents();
+  renderAgentStatus();
 }
 
 function addEvt(src, msg) {
@@ -587,6 +648,30 @@ function addEvt(src, msg) {
   log.appendChild(d);
   if (log.scrollHeight - log.scrollTop < log.clientHeight + 80) log.scrollTop = log.scrollHeight;
   while (log.children.length > 500) log.removeChild(log.firstChild);
+}
+
+function addActivity(src, type, data) {
+  const log = document.getElementById('activityLog');
+  const d = document.createElement('div');
+  d.className = 'evt';
+  const t = new Date().toLocaleTimeString('en-US',{hour12:false});
+  const labels = {
+    'agent_started': `▶️ ${data.agent} started`,
+    'agent_completed': `✅ ${data.agent} done`,
+    'dynamic_task_completed': `✅ ${data.agent} task done`,
+    'dynamic_task_failed': `❌ ${data.agent} failed`,
+    'task_dispatched': `🚀 → ${data.agent}`,
+    'agent_stalled': `⚠️ ${data.agent} stalled`,
+    'agent_stuck': `🛑 ${data.agent} stuck`,
+    'helper_dispatched': `🤝 ${data.idle_agent} → ${data.helping}`,
+    'file_write': `📝 ${(data.file||data.path||'').split('/').pop()}`,
+    'tool_call': `🔧 ${data.agent||src}: ${data.tool||''}`,
+    'kill_switch_triggered': '🛑 KILLED',
+    'config_updated': `⚙️ ${data.agent} config`,
+  };
+  d.innerHTML = `<span class="evt-t">${t}</span><span class="evt-s ${src}">${labels[type]||type}</span>`;
+  log.appendChild(d);
+  if (log.scrollHeight - log.scrollTop < log.clientHeight + 80) log.scrollTop = log.scrollHeight;
 }
 
 function trackFile(path, agent, bytes) {
@@ -624,148 +709,75 @@ function renderAgents() {
     </div>`).join('');
 }
 
+function renderAgentStatus() {
+  const c = document.getElementById('agentStatusList');
+  const list = Object.values(agents);
+  if (!list.length) return;
+  c.innerHTML = list.map(a => `
+    <div class="agent-status-row">
+      <div class="agent-status-dot ${a.status}"></div>
+      <span class="agent-status-name">${a.name}</span>
+      <span class="agent-status-info">${a.lastActivity || a.status}</span>
+    </div>
+  `).join('');
+}
+
+function updateMiniStats() {
+  const list = Object.values(agents);
+  const totalTokens = list.reduce((s,a) => s+(a.tokens||0), 0);
+  const totalFiles = list.reduce((s,a) => s+(a.filesW||0), 0);
+  const totalTools = list.reduce((s,a) => s+(a.tools||0), 0);
+  const totalIters = list.reduce((s,a) => s+(a.iter||0), 0);
+  document.getElementById('mTokens').textContent = fmtNum(totalTokens);
+  document.getElementById('mFiles').textContent = totalFiles;
+  document.getElementById('mTools').textContent = totalTools;
+  document.getElementById('mIters').textContent = totalIters;
+}
+
 // ── View Toggle ──
 function setView(v) {
   view = v;
   document.getElementById('vLive').classList.toggle('active', v==='live');
   document.getElementById('vAnalytics').classList.toggle('active', v==='analytics');
-  document.getElementById('eventPanel').style.display = v==='live' ? 'flex' : 'none';
-  document.getElementById('filePanel').style.display = v==='live' ? 'flex' : 'none';
-  const av = document.getElementById('analyticsView');
-  if (v==='analytics') { av.classList.add('active'); fetchAnalytics(); }
-  else { av.classList.remove('active'); }
-}
-
-// ── Analytics ──
-async function fetchAnalytics() {
-  try {
-    const r = await fetch('/api/analytics');
-    const d = await r.json();
-    renderAnalytics(d);
-  } catch(e) {
-    // Fall back to local session data
-    if (sessionData.length > 0) renderLocalAnalytics();
-    else document.getElementById('analyticsCont').innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:30px">No analytics yet</p>';
-  }
-}
-
-function renderAnalytics(d) {
-  if (!d || !d.agents || !d.agents.length) {
-    renderLocalAnalytics();
-    return;
-  }
-  // Compute accurate totals from live agents
-  const liveTokens = Object.values(agents).reduce((s,a) => s + (a.tokens||0), 0);
-  const liveTools = Object.values(agents).reduce((s,a) => s + (a.tools||0), 0);
-  const liveFiles = Object.values(agents).reduce((s,a) => s + (a.filesW||0), 0);
-  const totalTokens = Math.max(d.total_tokens, liveTokens);
-  const totalTools = Math.max(d.total_tool_calls, liveTools);
-  const totalFiles = Math.max(d.total_files_written, liveFiles);
-
-  let html = `
-    <div class="session-bar" id="sessionBar">${renderSessionChips()}</div>
-    <div class="analytics-grid">
-      <div class="stat-card blue"><div class="stat-value">${fmtNum(totalTokens)}</div><div class="stat-label">Total Tokens</div></div>
-      <div class="stat-card green"><div class="stat-value">${totalFiles}</div><div class="stat-label">Files Written</div></div>
-      <div class="stat-card purple"><div class="stat-value">${d.total_llm_calls||0}</div><div class="stat-label">LLM Calls</div></div>
-      <div class="stat-card amber"><div class="stat-value">${Math.round(d.total_duration_seconds||0)}s</div><div class="stat-label">Duration</div></div>
-    </div>
-    <table class="analytics-table"><thead><tr>
-      <th>Agent</th><th>Model</th><th>Status</th><th>Duration</th><th>Iter</th><th>LLM Calls</th><th>Tools</th><th>Success%</th><th>Tokens</th><th>Files W</th>
-    </tr></thead><tbody>
-    ${d.agents.map(a => {
-      const live = agents[a.name] || {};
-      return `<tr>
-        <td style="font-weight:600;font-family:Inter">${a.name}${a.was_helper?' 🤝':''}</td>
-        <td style="font-size:9px">${a.model||live.model||''}</td>
-        <td><span class="badge badge-${a.status||live.status||'unknown'}">${a.status||live.status||'?'}</span></td>
-        <td>${Math.round(a.duration_seconds||0)}s</td>
-        <td>${Math.max(a.total_iterations||0, live.iter||0)}</td>
-        <td>${a.total_llm_calls||0}</td>
-        <td>${Math.max(a.total_tool_calls||0, live.tools||0)}</td>
-        <td>${Math.round(a.tool_success_rate||0)}%</td>
-        <td>${fmtNum(Math.max(a.total_tokens||0, live.tokens||0))}</td>
-        <td>${Math.max(a.files_written||0, live.filesW||0)}</td>
-      </tr>`;
-    }).join('')}
-    </tbody></table>
-    ${d.helpers && d.helpers.length ? `
-      <h3 style="font-size:13px;margin-bottom:6px">🤝 Helper Dispatches</h3>
-      <table class="analytics-table"><thead><tr><th>Helper</th><th>Helped</th><th>Success</th><th>Files</th><th>Tools</th></tr></thead>
-      <tbody>${d.helpers.map(h => `<tr><td>${h.idle_agent}</td><td>${h.helped_agent}</td><td>${h.success?'✅':'❌'}</td><td>${h.files_written}</td><td>${h.tool_calls}</td></tr>`).join('')}</tbody></table>
-    ` : ''}
-    <p style="font-size:10px;color:var(--text-muted);margin-top:8px">Manager nudges: ${d.manager_nudges||0} | Session: ${d.session_id||'current'}</p>
-  `;
-  document.getElementById('analyticsCont').innerHTML = html;
-}
-
-function renderLocalAnalytics() {
-  // Build analytics from local agent data
-  const list = Object.values(agents);
-  if (!list.length) { document.getElementById('analyticsCont').innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:30px">No data yet</p>'; return; }
-  const totalTokens = list.reduce((s,a) => s+(a.tokens||0), 0);
-  const totalTools = list.reduce((s,a) => s+(a.tools||0), 0);
-  const totalFiles = list.reduce((s,a) => s+(a.filesW||0), 0);
-  const elapsed = Math.round((Date.now() - startTime) / 1000);
-
-  let html = `
-    <div class="session-bar">${renderSessionChips()}</div>
-    <div class="analytics-grid">
-      <div class="stat-card blue"><div class="stat-value">${fmtNum(totalTokens)}</div><div class="stat-label">Total Tokens</div></div>
-      <div class="stat-card green"><div class="stat-value">${totalFiles}</div><div class="stat-label">Files Written</div></div>
-      <div class="stat-card purple"><div class="stat-value">${totalTools}</div><div class="stat-label">Tool Calls</div></div>
-      <div class="stat-card amber"><div class="stat-value">${elapsed}s</div><div class="stat-label">Duration</div></div>
-    </div>
-    <table class="analytics-table"><thead><tr><th>Agent</th><th>Model</th><th>Status</th><th>Iter</th><th>Tools</th><th>Tokens</th><th>Files</th></tr></thead>
-    <tbody>${list.map(a => `<tr>
-      <td style="font-weight:600;font-family:Inter">${a.name}</td>
-      <td style="font-size:9px">${a.model||''}</td>
-      <td><span class="badge badge-${a.status}">${a.status}</span></td>
-      <td>${a.iter}</td><td>${a.tools}</td><td>${fmtNum(a.tokens)}</td><td>${a.filesW}W/${a.filesR}R</td>
-    </tr>`).join('')}</tbody></table>
-  `;
-  document.getElementById('analyticsCont').innerHTML = html;
-}
-
-function renderSessionChips() {
-  // Load previous sessions
-  let sessions = [];
-  try { sessions = JSON.parse(localStorage.getItem('swarm_sessions') || '[]'); } catch(e) {}
-  if (!sessions.length) return '<span style="font-size:10px;color:var(--text-muted)">Current session</span>';
-  return sessions.map((s,i) => {
-    const d = new Date(s.start);
-    return `<span class="session-chip" onclick="loadSession(${i})">${d.toLocaleDateString()} ${d.toLocaleTimeString()} (${s.events?.length||0} events)</span>`;
-  }).join('') + '<span class="session-chip active">Current</span>';
-}
-
-function loadSession(idx) {
-  try {
-    const sessions = JSON.parse(localStorage.getItem('swarm_sessions') || '[]');
-    const s = sessions[idx];
-    if (s && s.agents) renderLocalAnalytics(); // simplified
-  } catch(e) {}
 }
 
 // ── Chat ──
+let typingEl = null;
 function sendChat() {
   const inp = document.getElementById('chatInput');
   const msg = inp.value.trim();
   if (!msg) return;
   inp.value = '';
-  inp.style.height = '40px';
+  inp.style.height = '44px';
   addChat('user', msg);
+  showTyping();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ action: 'chat', message: msg }));
   }
 }
 
 function addChat(role, message) {
+  hideTyping();
   const c = document.getElementById('chatMsgs');
   const d = document.createElement('div');
   d.className = `chat-msg ${role}`;
   d.textContent = message;
   c.appendChild(d);
   c.scrollTop = c.scrollHeight;
+}
+
+function showTyping() {
+  if (typingEl) return;
+  const c = document.getElementById('chatMsgs');
+  typingEl = document.createElement('div');
+  typingEl.className = 'typing-indicator';
+  typingEl.textContent = '🧠 Manager is thinking...';
+  c.appendChild(typingEl);
+  c.scrollTop = c.scrollHeight;
+}
+
+function hideTyping() {
+  if (typingEl) { typingEl.remove(); typingEl = null; }
 }
 
 // ── Config Modal ──
@@ -775,7 +787,6 @@ function openConfig(name) {
   document.getElementById('configModal').classList.add('active');
   fetch(`/api/agent/${name}/config`).then(r=>r.json()).then(cfg => {
     const sel = document.getElementById('cfgModel');
-    // Add option if not in list
     let found = false;
     for (const o of sel.options) { if (o.value === cfg.model) { found = true; break; } }
     if (!found && cfg.model) { const o = document.createElement('option'); o.value=o.textContent=cfg.model; sel.appendChild(o); }
@@ -812,7 +823,6 @@ function setFolder() {
   const path = document.getElementById('folderPath').value.trim();
   if (!path) return;
   document.getElementById('folderBtn').textContent = `📁 ${path.split('/').slice(-2).join('/')}`;
-  // Send to manager chat
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ action: 'chat', message: `Set workspace to: ${path}` }));
   }
@@ -854,8 +864,8 @@ function togglePauseAll() {
 
 // Auto-resize chat input
 document.getElementById('chatInput').addEventListener('input', function() {
-  this.style.height = '40px';
-  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  this.style.height = '44px';
+  this.style.height = Math.min(this.scrollHeight, 140) + 'px';
 });
 
 // Utils
@@ -863,9 +873,6 @@ function trunc(s, n) { return s.length > n ? s.substring(0, n) + '…' : s; }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function fmtNum(n) { return n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n||0); }
 function fmtBytes(b) { return b >= 1024 ? (b/1024).toFixed(1)+'KB' : b+'B'; }
-
-// Load sessions from localStorage
-try { sessionData = JSON.parse(localStorage.getItem('swarm_sessions') || '[]'); } catch(e) { sessionData = []; }
 
 // Init
 connect();

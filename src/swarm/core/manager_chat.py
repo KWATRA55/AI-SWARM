@@ -57,29 +57,29 @@ class ManagerChat:
         response = await chat.send_message("What needs improvement?")
     """
 
-    SYSTEM_PROMPT = """You are the **Manager** of an AI engineering team. You communicate with the human team lead through this chat.
+    SYSTEM_PROMPT = """You are the **Manager / Architect** of an AI engineering team. You are the user's primary contact on the dashboard.
 
 **Your capabilities:**
-1. **Codebase Analysis**: You can scan and read any file in the workspace to understand the current state of the project.
-2. **Task Assignment**: You can assign tasks to your sub-agents (backend-dev, frontend-dev, db-engineer, qa-engineer) by calling the dispatch function.
-3. **Progress Monitoring**: You can track what each agent has done and report progress.
-4. **Suggestions**: Proactively suggest features, optimizations, bug fixes, and architectural improvements.
+1. **Codebase Analysis**: Scan and read any file in the workspace.
+2. **Task Assignment**: Assign tasks to sub-agents (backend-dev, frontend-dev, db-engineer, qa-engineer, architect) by calling dispatch_task.
+3. **Status Monitoring**: Check agent status with get_agent_status() and proactively report updates.
+4. **Suggestions**: Proactively suggest features, optimizations, bug fixes.
 
-**Communication style:**
-- Be concise and direct — you're a principal engineer
-- Use markdown formatting for readability
-- When suggesting work, break it into actionable tasks
-- When the user asks you to do something, confirm the plan first, then execute
+**Communication rules:**
+- Be concise, direct, and action-oriented
+- When assigning work to multiple agents, dispatch ALL of them in a single response
+- After dispatching, confirm which agents got what tasks
+- When the user asks for status, call get_agent_status() first
+- Proactively report when agents complete or fail
 
 **Available tools:**
-- scan_codebase() — get a full directory tree with file sizes
-- read_file(path) — read a specific file
-- dispatch_task(agent, task_description) — assign work to a sub-agent
-- get_agent_status() — check what agents are doing
+- read_file(path) — read a workspace file
+- dispatch_task(agent, task_description) — assign work to a sub-agent  
+- get_agent_status() — check all agents' current status
 
 **Current workspace:** {workspace}
 
-Always be proactive. If the user says "go ahead", start dispatching tasks immediately."""
+Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again."""
 
     def __init__(
         self,
@@ -88,11 +88,13 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
         workspace: Path,
         dispatch_fn: Callable[..., Coroutine] | None = None,
         dashboard_cb: Callable[..., Coroutine] | None = None,
+        state: Any | None = None,
     ) -> None:
         self._model = model
         self._workspace = workspace
         self._dispatch_fn = dispatch_fn
         self._dashboard_cb = dashboard_cb
+        self._state = state  # SwarmState — for agent status lookups
 
         # Conversation history
         self._messages: list[dict[str, str]] = [{
@@ -153,7 +155,7 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                 "type": "function",
                 "function": {
                     "name": "dispatch_task",
-                    "description": "Assign a task to a sub-agent. Available agents: backend-dev, frontend-dev, db-engineer, qa-engineer",
+                    "description": "Assign a task to a sub-agent. Available agents: architect, backend-dev, frontend-dev, db-engineer, qa-engineer",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -170,55 +172,61 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_agent_status",
+                    "description": "Get the current status of all agents — running, completed, failed, idle",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
         ]
 
-        try:
-            response = await litellm.acompletion(
-                model=self._model,
-                messages=self._messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.3,
-            )
-        except Exception as exc:
-            error_msg = f"❌ Manager LLM error: {exc}"
-            await logger.error("manager_chat.llm_failed", error=str(exc))
-            return error_msg
-
-        choice = response.choices[0]
-        message = choice.message
-
-        # Handle tool calls
-        if message.tool_calls:
-            self._messages.append(message.model_dump())
-
-            for tool_call in message.tool_calls:
-                fn_name = tool_call.function.name
-                import json
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = await self._execute_tool(fn_name, args)
-                self._messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                })
-
-            # Get the final response after tool use
+        # Multi-round tool calling loop
+        max_rounds = 5
+        content = ""
+        for _ in range(max_rounds):
             try:
-                response2 = await litellm.acompletion(
+                response = await litellm.acompletion(
                     model=self._model,
                     messages=self._messages,
+                    tools=tools,
+                    tool_choice="auto",
                     temperature=0.3,
                 )
-                content = response2.choices[0].message.content or ""
             except Exception as exc:
-                content = f"Manager processed tools but follow-up failed: {exc}"
-        else:
-            content = message.content or ""
+                error_msg = f"❌ Manager LLM error: {exc}"
+                await logger.error("manager_chat.llm_failed", error=str(exc))
+                return error_msg
+
+            choice = response.choices[0]
+            message = choice.message
+
+            if message.tool_calls:
+                self._messages.append(message.model_dump())
+
+                for tool_call in message.tool_calls:
+                    fn_name = tool_call.function.name
+                    import json
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    result = await self._execute_tool(fn_name, args)
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    })
+                # Continue loop — LLM needs to process tool results
+                continue
+            else:
+                content = message.content or ""
+                break
 
         self._messages.append({"role": "assistant", "content": content})
 
@@ -242,6 +250,8 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                 args.get("agent", ""),
                 args.get("task_description", ""),
             )
+        elif name == "get_agent_status":
+            return await self._get_agent_status()
         return f"Unknown tool: {name}"
 
     async def _scan_codebase(self) -> str:
@@ -310,6 +320,25 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
             return f"✅ Task dispatched to {agent}: {task[:200]}"
         except Exception as exc:
             return f"❌ Failed to dispatch to {agent}: {exc}"
+
+    async def _get_agent_status(self) -> str:
+        """Get current status of all agents from SwarmState."""
+        if self._state is None:
+            return "Agent status not available — state not connected"
+
+        try:
+            snapshot = await self._state.snapshot()
+            lines: list[str] = []
+            for name, agent in snapshot.agents.items():
+                status = agent.status.value if hasattr(agent.status, 'value') else str(agent.status)
+                lines.append(
+                    f"• {name}: {status} | "
+                    f"iter={agent.iterations} | "
+                    f"tokens={agent.token_usage.total_tokens}"
+                )
+            return "\n".join(lines) if lines else "No agents registered yet"
+        except Exception as exc:
+            return f"Error getting agent status: {exc}"
 
     @property
     def message_count(self) -> int:

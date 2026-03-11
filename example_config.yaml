@@ -1,0 +1,172 @@
+# =============================================================================
+# AI Swarm — Example Configuration
+# =============================================================================
+# This config defines a 3-agent swarm for building a full-stack web application.
+# Each agent targets a different LLM provider to demonstrate multi-model routing.
+#
+# Environment variables can be interpolated with ${VAR} or ${VAR:-default}.
+
+name: "fullstack-webapp"
+version: "1"
+workspace: "${PROJECT_WORKSPACE:-/tmp/swarm-workspace}"
+
+# ── Default LLM ──────────────────────────────────────────────────────────────
+default_model: "gpt-4o"
+
+# ── API keys (prefer env vars, these are overrides) ──────────────────────────
+# api_keys:
+#   openai: "${OPENAI_API_KEY}"
+#   anthropic: "${ANTHROPIC_API_KEY}"
+#   google: "${GOOGLE_API_KEY}"
+
+# ── Agent Definitions ────────────────────────────────────────────────────────
+agents:
+
+  - name: "backend-agent"
+    role: "backend"
+    model: "gemini/gemini-2.5-pro"
+    temperature: 0.1
+    max_iterations: 40
+    timeout_seconds: 900
+    system_prompt: |
+      You are a senior backend engineer. You build robust, production-ready
+      REST APIs and services. You write clean, well-tested Python code using
+      modern async patterns.
+      
+      Your workspace is a shared repository. Always check existing code before
+      creating new files. Follow established patterns and conventions.
+    tools:
+      - read_file
+      - write_file
+      - list_directory
+      - run_command
+      - git_diff
+      - git_commit
+    sandbox:
+      image: "python:3.12-slim"
+      resources:
+        memory: "2g"
+        cpu_count: 2.0
+      startup_commands:
+        - "pip install fastapi uvicorn sqlalchemy alembic pydantic"
+      env_vars:
+        DATABASE_URL: "sqlite:///./app.db"
+    mcp:
+      transport: "sse"
+      port: 8765
+      allowed_tools:
+        - read_file
+        - write_file
+        - list_directory
+        - run_command
+        - git_diff
+        - git_commit
+      workspace_subpath: "."
+
+  - name: "frontend-agent"
+    role: "frontend"
+    model: "anthropic/claude-sonnet-4-20250514"
+    temperature: 0.2
+    max_iterations: 50
+    timeout_seconds: 900
+    system_prompt: |
+      You are a senior frontend engineer specialising in React and Next.js.
+      You create beautiful, responsive UIs with excellent UX. You write
+      TypeScript with strict mode enabled.
+      
+      The backend API is being built concurrently. Check the shared workspace
+      for API schemas and types. Coordinate through the workspace files.
+    tools:
+      - read_file
+      - write_file
+      - list_directory
+      - run_command
+    depends_on:
+      - "backend-agent"        # Wait for API schema to be defined first
+    sandbox:
+      image: "node:20-slim"
+      resources:
+        memory: "4g"
+        cpu_count: 2.0
+      extra_ports:
+        - "3000:3000"          # Next.js dev server
+      startup_commands:
+        - "npm install -g pnpm"
+    mcp:
+      transport: "sse"
+      port: 8766
+      workspace_subpath: "."
+
+  - name: "qa-agent"
+    role: "qa"
+    model: "gpt-4o"
+    temperature: 0.0
+    max_iterations: 30
+    timeout_seconds: 600
+    system_prompt: |
+      You are a QA engineer responsible for testing and quality assurance.
+      You write comprehensive test suites, run linters, and verify that the
+      backend and frontend integrate correctly.
+      
+      Do not modify application code — only create test files, run tests,
+      and report issues back.
+    tools:
+      - read_file
+      - list_directory
+      - run_command
+    depends_on:
+      - "backend-agent"
+      - "frontend-agent"
+    sandbox:
+      image: "python:3.12-slim"
+      resources:
+        memory: "1g"
+        cpu_count: 1.0
+      startup_commands:
+        - "pip install pytest httpx playwright"
+        - "playwright install chromium"
+    mcp:
+      transport: "sse"
+      port: 8767
+      allowed_tools:
+        - read_file
+        - list_directory
+        - run_command
+      blocked_commands:
+        - "rm -rf /"
+        - "shutdown"
+      workspace_subpath: "."
+
+# ── Event Bus (Redis) ────────────────────────────────────────────────────────
+event_bus:
+  redis_url: "${REDIS_URL:-redis://localhost:6379/0}"
+  stream_prefix: "swarm"
+  consumer_group: "orchestrator"
+  max_stream_length: 10000
+
+# ── Circuit Breaker ──────────────────────────────────────────────────────────
+circuit_breaker:
+  max_round_trips: 5
+  cooldown_seconds: 30
+  escalation_strategy: "pause_and_notify"
+
+# ── State Compression ────────────────────────────────────────────────────────
+compression:
+  enabled: true
+  token_threshold: 4000
+  compression_model: "gemini/gemini-2.0-flash"
+  archive_to_redis: true
+
+# ── Visual Verification ──────────────────────────────────────────────────────
+verification:
+  enabled: true
+  vision_model: "gpt-4o"
+  screenshot_timeout_ms: 15000
+  viewport_width: 1280
+  viewport_height: 800
+  pass_threshold: 0.8
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging:
+  level: "info"
+  json_output: true

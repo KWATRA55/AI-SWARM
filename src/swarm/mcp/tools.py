@@ -1,0 +1,621 @@
+"""MCP tool definitions — the capabilities exposed to sandboxed agents.
+
+Each tool is defined as a Pydantic schema (for input validation and
+OpenAI-compatible function calling) paired with an async executor function.
+
+Architecture
+------------
+
+.. code-block:: text
+
+    Agent (inside Docker) ──► MCP Client
+                                  │
+                          (SSE or STDIO)
+                                  │
+                                  ▼
+    Host ──► MCP Server ──► ToolRegistry
+                                  │
+                 ┌────────────────┼────────────────┐
+                 ▼                ▼                 ▼
+            read_file        write_file       run_command
+          (direct I/O)    (Event Bus lock)   (docker exec)
+                                  │
+                                  ▼
+                          FILE_WRITE_REQUEST
+                          (Redis Stream)
+                                  │
+                                  ▼
+                          FileWriteHandler
+                          (acquires lock → writes → releases)
+
+CRITICAL: ``write_file`` does NOT write directly to disk.
+It publishes a ``FILE_WRITE_REQUEST`` event to the Redis Event Bus so that
+concurrent agent writes are safely serialised through the distributed lock.
+
+Tool list
+---------
+* ``read_file``      — Read file contents from the shared workspace.
+* ``write_file``     — Write/create a file (via Event Bus lock).
+* ``list_directory``  — List contents of a directory.
+* ``run_command``    — Execute a shell command in the agent's sandbox.
+* ``git_diff``       — Show unstaged changes in the workspace.
+* ``git_commit``     — Stage and commit changes.
+* ``search_memory``  — Search long-term memory for relevant knowledge.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import uuid
+from pathlib import Path
+from typing import Any
+
+import structlog
+from pydantic import BaseModel, Field
+
+from swarm.events.bus import EventBus, SwarmEvent
+from swarm.events.channels import EventType, StreamChannel
+
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool input/output schemas (OpenAI function-calling compatible)
+# ---------------------------------------------------------------------------
+
+
+class ReadFileInput(BaseModel):
+    """Input schema for the read_file tool."""
+    path: str = Field(description="Relative path to the file within the workspace.")
+    start_line: int | None = Field(default=None, description="Optional 1-based start line.")
+    end_line: int | None = Field(default=None, description="Optional 1-based end line.")
+
+
+class WriteFileInput(BaseModel):
+    """Input schema for the write_file tool."""
+    path: str = Field(description="Relative path to the file within the workspace.")
+    content: str = Field(description="Full file content to write.")
+    create_dirs: bool = Field(default=True, description="Create parent directories if needed.")
+
+
+class ListDirectoryInput(BaseModel):
+    """Input schema for the list_directory tool."""
+    path: str = Field(default=".", description="Relative directory path within the workspace.")
+    recursive: bool = Field(default=False, description="Whether to list recursively.")
+    max_depth: int = Field(default=3, ge=1, le=10, description="Max depth for recursive listing.")
+
+
+class RunCommandInput(BaseModel):
+    """Input schema for the run_command tool."""
+    command: str = Field(description="Shell command to execute.")
+    timeout: float = Field(default=60.0, ge=1.0, le=600.0, description="Timeout in seconds.")
+    workdir: str | None = Field(default=None, description="Optional working directory override.")
+
+
+class GitDiffInput(BaseModel):
+    """Input schema for the git_diff tool."""
+    path: str | None = Field(default=None, description="Optional specific file/directory to diff.")
+    staged: bool = Field(default=False, description="Show staged changes instead of unstaged.")
+
+
+class GitCommitInput(BaseModel):
+    """Input schema for the git_commit tool."""
+    message: str = Field(description="Commit message.")
+    paths: list[str] = Field(default_factory=lambda: ["."], description="Paths to stage before committing.")
+
+
+class SearchMemoryInput(BaseModel):
+    """Input schema for the search_memory tool."""
+    query: str = Field(description="Natural language search query.")
+    category: str | None = Field(default=None, description="Optional category filter: skills, bugs, rules, patterns, preferences.")
+    limit: int = Field(default=5, ge=1, le=20, description="Maximum results to return.")
+
+
+class ToolResult(BaseModel):
+    """Standardised tool execution result."""
+    success: bool
+    output: str = ""
+    error: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Tool descriptor (for OpenAI function-calling format)
+# ---------------------------------------------------------------------------
+
+
+class ToolDescriptor(BaseModel):
+    """Describes a single MCP tool in OpenAI function-calling format."""
+    name: str
+    description: str
+    parameters: dict[str, Any] = Field(description="JSON Schema for the tool's input.")
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+
+# Map of tool name → (descriptor, input_model_class)
+TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
+    "read_file": ToolDescriptor(
+        name="read_file",
+        description=(
+            "Read the contents of a file from the shared workspace. "
+            "Returns the file content as text. Supports optional line range."
+        ),
+        parameters=ReadFileInput.model_json_schema(),
+    ),
+    "write_file": ToolDescriptor(
+        name="write_file",
+        description=(
+            "Write or create a file in the shared workspace. The write is "
+            "safely serialised through the event bus to prevent concurrent "
+            "write corruption from parallel agents."
+        ),
+        parameters=WriteFileInput.model_json_schema(),
+    ),
+    "list_directory": ToolDescriptor(
+        name="list_directory",
+        description=(
+            "List the contents of a directory in the workspace. "
+            "Returns file names, sizes, and types."
+        ),
+        parameters=ListDirectoryInput.model_json_schema(),
+    ),
+    "run_command": ToolDescriptor(
+        name="run_command",
+        description=(
+            "Execute a shell command inside the agent's sandbox container. "
+            "Returns stdout, stderr, and exit code."
+        ),
+        parameters=RunCommandInput.model_json_schema(),
+    ),
+    "git_diff": ToolDescriptor(
+        name="git_diff",
+        description="Show git diff of changes in the workspace.",
+        parameters=GitDiffInput.model_json_schema(),
+    ),
+    "git_commit": ToolDescriptor(
+        name="git_commit",
+        description="Stage files and create a git commit in the workspace.",
+        parameters=GitCommitInput.model_json_schema(),
+    ),
+    "search_memory": ToolDescriptor(
+        name="search_memory",
+        description=(
+            "Search the team's long-term memory for relevant knowledge from "
+            "past sessions: bug fixes, architectural patterns, coding conventions."
+        ),
+        parameters=SearchMemoryInput.model_json_schema(),
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool executor
+# ---------------------------------------------------------------------------
+
+
+class ToolExecutor:
+    """Executes MCP tools with safety checks and event bus integration.
+
+    The executor is the bridge between LLM tool calls and actual operations.
+    It validates inputs, enforces the tool whitelist and blocked commands,
+    and routes writes through the event bus for lock-based serialisation.
+
+    Usage::
+
+        executor = ToolExecutor(
+            workspace=Path("/workspace"),
+            event_bus=bus,
+            allowed_tools=["read_file", "write_file", "run_command"],
+            blocked_commands=["rm -rf /"],
+        )
+
+        result = await executor.execute("read_file", {"path": "src/main.py"})
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        event_bus: EventBus | None = None,
+        compressor: Any | None = None,
+        sandbox_exec: Any | None = None,
+        allowed_tools: list[str] | None = None,
+        blocked_commands: list[str] | None = None,
+        agent_name: str = "unknown",
+    ) -> None:
+        self._workspace = workspace.resolve()
+        self._event_bus = event_bus
+        self._compressor = compressor
+        self._sandbox_exec = sandbox_exec  # Callable: async (cmd, timeout) -> (exit_code, output)
+        self._allowed = set(allowed_tools or TOOL_DEFINITIONS.keys())
+        self._blocked = blocked_commands or []
+        self._agent_name = agent_name
+
+        # Dispatch table
+        self._handlers: dict[str, Any] = {
+            "read_file": self._exec_read_file,
+            "write_file": self._exec_write_file,
+            "list_directory": self._exec_list_directory,
+            "run_command": self._exec_run_command,
+            "git_diff": self._exec_git_diff,
+            "git_commit": self._exec_git_commit,
+            "search_memory": self._exec_search_memory,
+        }
+
+    def get_tool_descriptors(self) -> list[ToolDescriptor]:
+        """Return descriptors for all allowed tools (for LLM function calling)."""
+        return [
+            TOOL_DEFINITIONS[name]
+            for name in self._allowed
+            if name in TOOL_DEFINITIONS
+        ]
+
+    def get_openai_tools(self) -> list[dict[str, Any]]:
+        """Return tools in OpenAI function-calling format for litellm."""
+        tools = []
+        for desc in self.get_tool_descriptors():
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": desc.name,
+                    "description": desc.description,
+                    "parameters": desc.parameters,
+                },
+            })
+        return tools
+
+    async def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Execute a tool by name with the given arguments.
+
+        Parameters
+        ----------
+        tool_name:
+            Name of the MCP tool to execute.
+        arguments:
+            Tool-specific arguments (validated against the Pydantic schema).
+
+        Returns
+        -------
+        ToolResult
+            Standardised result with success flag, output, and error.
+        """
+        if tool_name not in self._allowed:
+            return ToolResult(
+                success=False,
+                error=f"Tool '{tool_name}' is not in the allowed list for this agent.",
+            )
+
+        handler = self._handlers.get(tool_name)
+        if handler is None:
+            return ToolResult(
+                success=False,
+                error=f"Unknown tool: '{tool_name}'.",
+            )
+
+        try:
+            result = await handler(arguments)
+            await logger.info(
+                "tool.executed",
+                tool=tool_name,
+                agent=self._agent_name,
+                success=result.success,
+            )
+            return result
+        except Exception as exc:
+            await logger.error(
+                "tool.execution_failed",
+                tool=tool_name,
+                agent=self._agent_name,
+                error=str(exc),
+            )
+            return ToolResult(success=False, error=f"Tool execution failed: {exc}")
+
+    # -------------------------------------------------------------------
+    # Tool implementations
+    # -------------------------------------------------------------------
+
+    async def _exec_read_file(self, args: dict[str, Any]) -> ToolResult:
+        """Read file contents from the workspace."""
+        params = ReadFileInput.model_validate(args)
+        target = self._resolve_path(params.path)
+
+        if not target.exists():
+            return ToolResult(success=False, error=f"File not found: {params.path}")
+        if not target.is_file():
+            return ToolResult(success=False, error=f"Not a file: {params.path}")
+
+        try:
+            content = target.read_text(encoding="utf-8")
+
+            # Apply line range if specified
+            if params.start_line or params.end_line:
+                lines = content.splitlines(keepends=True)
+                start = (params.start_line or 1) - 1  # 0-indexed
+                end = params.end_line or len(lines)
+                content = "".join(lines[start:end])
+
+            return ToolResult(
+                success=True,
+                output=content,
+                metadata={"path": str(target), "size": target.stat().st_size},
+            )
+        except UnicodeDecodeError:
+            return ToolResult(
+                success=False,
+                error=f"Cannot read binary file: {params.path}",
+            )
+
+    async def _exec_write_file(self, args: dict[str, Any]) -> ToolResult:
+        """Write a file via the Event Bus distributed lock.
+
+        CRITICAL: This does NOT write directly to disk.
+        The write request is published to the Redis Event Bus, which
+        serialises it through a distributed lock to prevent corruption.
+
+        If no event bus is available (local dev mode), falls back to a
+        local asyncio lock for process-level serialisation.
+        """
+        params = WriteFileInput.model_validate(args)
+        target = self._resolve_path(params.path)
+
+        # --- Route through Event Bus (production) ---
+        if self._event_bus is not None and self._event_bus.connected:
+            request_id = uuid.uuid4().hex[:12]
+
+            # Publish the write request
+            event = SwarmEvent(
+                channel=StreamChannel.FILE_WRITE_REQUEST.value,
+                event_type=EventType.WRITE_REQUEST,
+                sender=self._agent_name,
+                payload={
+                    "file_path": str(target),
+                    "content": params.content,
+                    "agent": self._agent_name,
+                    "request_id": request_id,
+                    "create_dirs": params.create_dirs,
+                },
+            )
+            entry_id = await self._event_bus.publish(
+                StreamChannel.FILE_WRITE_REQUEST.value, event,
+            )
+
+            if entry_id:
+                await logger.info(
+                    "tool.write_file_queued",
+                    agent=self._agent_name,
+                    path=params.path,
+                    request_id=request_id,
+                    entry_id=entry_id,
+                )
+                return ToolResult(
+                    success=True,
+                    output=f"Write request queued for '{params.path}' (request_id={request_id}).",
+                    metadata={"request_id": request_id, "entry_id": entry_id},
+                )
+            else:
+                # Publish failed — fall through to local write
+                await logger.warning(
+                    "tool.write_file_publish_failed",
+                    agent=self._agent_name,
+                    path=params.path,
+                    msg="Falling back to direct write with local lock.",
+                )
+
+        # --- Fallback: direct write with local lock ---
+        return await self._direct_write(target, params.content, params.create_dirs)
+
+    async def _direct_write(
+        self, target: Path, content: str, create_dirs: bool,
+    ) -> ToolResult:
+        """Direct file write with local asyncio lock (fallback mode)."""
+        try:
+            if create_dirs:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            return ToolResult(
+                success=True,
+                output=f"File written: {target} ({len(content)} bytes)",
+                metadata={"path": str(target), "bytes_written": len(content)},
+            )
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Write failed: {exc}")
+
+    async def _exec_list_directory(self, args: dict[str, Any]) -> ToolResult:
+        """List directory contents."""
+        params = ListDirectoryInput.model_validate(args)
+        target = self._resolve_path(params.path)
+
+        if not target.exists():
+            return ToolResult(success=False, error=f"Directory not found: {params.path}")
+        if not target.is_dir():
+            return ToolResult(success=False, error=f"Not a directory: {params.path}")
+
+        entries: list[str] = []
+
+        def _walk(dir_path: Path, depth: int = 0, prefix: str = "") -> None:
+            if depth > params.max_depth:
+                return
+            try:
+                items = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+                for item in items:
+                    # Skip hidden files and common ignore patterns
+                    if item.name.startswith(".") or item.name in {
+                        "node_modules", "__pycache__", ".git", ".venv", "venv",
+                    }:
+                        continue
+
+                    rel = item.resolve().relative_to(self._workspace)
+                    if item.is_dir():
+                        entries.append(f"{prefix}{rel}/")
+                        if params.recursive:
+                            _walk(item, depth + 1, prefix)
+                    else:
+                        size = item.stat().st_size
+                        entries.append(f"{prefix}{rel}  ({size:,} bytes)")
+
+                    if len(entries) > 200:  # Safety cap
+                        entries.append("... (truncated at 200 entries)")
+                        return
+            except PermissionError:
+                entries.append(f"{prefix}[permission denied]")
+
+        _walk(target)
+        return ToolResult(
+            success=True,
+            output="\n".join(entries) if entries else "(empty directory)",
+            metadata={"count": len(entries)},
+        )
+
+    async def _exec_run_command(self, args: dict[str, Any]) -> ToolResult:
+        """Execute a shell command."""
+        params = RunCommandInput.model_validate(args)
+
+        # Security: check blocked commands
+        cmd_lower = params.command.lower()
+        for blocked in self._blocked:
+            if blocked.lower() in cmd_lower:
+                return ToolResult(
+                    success=False,
+                    error=f"Command blocked by security policy: contains '{blocked}'.",
+                )
+
+        # Route through sandbox if available
+        if self._sandbox_exec is not None:
+            try:
+                exit_code, output = await self._sandbox_exec(
+                    params.command, params.timeout,
+                )
+                return ToolResult(
+                    success=exit_code == 0,
+                    output=output,
+                    error="" if exit_code == 0 else f"Exit code: {exit_code}",
+                    metadata={"exit_code": exit_code},
+                )
+            except Exception as exc:
+                return ToolResult(success=False, error=f"Sandbox exec failed: {exc}")
+
+        # Fallback: local subprocess
+        try:
+            workdir = params.workdir or str(self._workspace)
+            proc = await asyncio.create_subprocess_shell(
+                params.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=workdir,
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=params.timeout,
+            )
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            exit_code = proc.returncode or 0
+
+            return ToolResult(
+                success=exit_code == 0,
+                output=output[-10_000:],  # Cap output length
+                error="" if exit_code == 0 else f"Exit code: {exit_code}",
+                metadata={"exit_code": exit_code},
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                success=False,
+                error=f"Command timed out after {params.timeout}s.",
+            )
+
+    async def _exec_git_diff(self, args: dict[str, Any]) -> ToolResult:
+        """Show git diff."""
+        params = GitDiffInput.model_validate(args)
+        cmd = "git diff"
+        if params.staged:
+            cmd += " --staged"
+        if params.path:
+            cmd += f" -- {params.path}"
+
+        return await self._exec_run_command({"command": cmd, "timeout": 30.0})
+
+    async def _exec_git_commit(self, args: dict[str, Any]) -> ToolResult:
+        """Stage and commit files."""
+        params = GitCommitInput.model_validate(args)
+
+        # Stage files
+        paths_str = " ".join(params.paths)
+        stage_result = await self._exec_run_command({
+            "command": f"git add {paths_str}",
+            "timeout": 30.0,
+        })
+        if not stage_result.success:
+            return stage_result
+
+        # Commit
+        safe_msg = params.message.replace('"', '\\"')
+        return await self._exec_run_command({
+            "command": f'git commit -m "{safe_msg}"',
+            "timeout": 30.0,
+        })
+
+    async def _exec_search_memory(self, args: dict[str, Any]) -> ToolResult:
+        """Search long-term memory."""
+        params = SearchMemoryInput.model_validate(args)
+
+        if self._compressor is None:
+            return ToolResult(
+                success=False,
+                error="Long-term memory is not available.",
+            )
+
+        try:
+            memories = await self._compressor.search_memories(
+                params.query,
+                category=params.category,
+                limit=params.limit,
+            )
+
+            if not memories:
+                return ToolResult(
+                    success=True,
+                    output="No relevant memories found.",
+                )
+
+            lines: list[str] = []
+            for i, mem in enumerate(memories, 1):
+                lines.append(f"[{i}] [{mem.category.upper()}] {mem.title}")
+                lines.append(f"    {mem.content}")
+                if mem.tags:
+                    lines.append(f"    Tags: {', '.join(mem.tags)}")
+                lines.append(f"    Source: {mem.source_agent} / {mem.source_task}")
+                lines.append("")
+
+            return ToolResult(
+                success=True,
+                output="\n".join(lines),
+                metadata={"count": len(memories)},
+            )
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Memory search failed: {exc}")
+
+    # -------------------------------------------------------------------
+    # Path resolution & security
+    # -------------------------------------------------------------------
+
+    def _resolve_path(self, relative: str) -> Path:
+        """Resolve a relative path against the workspace, preventing traversal."""
+        clean = Path(relative).as_posix()
+        # Prevent directory traversal
+        if ".." in clean.split("/"):
+            raise ValueError(f"Path traversal not allowed: {relative}")
+
+        resolved = (self._workspace / clean).resolve()
+
+        # Ensure the resolved path is within the workspace
+        try:
+            resolved.relative_to(self._workspace)
+        except ValueError:
+            raise ValueError(
+                f"Path '{relative}' resolves outside the workspace: {resolved}"
+            )
+
+        return resolved

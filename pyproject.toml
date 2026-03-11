@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-swarm"
+version = "0.1.0"
+description = "A parallel, stack-agnostic multi-agent swarm orchestration platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Shashwat" }]
+
+dependencies = [
+    # --- Core ---
+    "pydantic>=2.6,<3",
+    "pyyaml>=6.0,<7",
+    "anyio>=4.4,<5",
+
+    # --- CLI ---
+    "typer[all]>=0.12,<1",
+
+    # --- LLM ---
+    "litellm>=1.40,<2",
+    "tiktoken>=0.7,<1",
+
+    # --- Messaging / Event Bus ---
+    "redis[hiredis]>=5.0,<6",
+
+    # --- Sandboxing ---
+    "docker>=7.1,<8",
+
+    # --- Verification ---
+    "playwright>=1.44,<2",
+
+    # --- Observability ---
+    "structlog>=24.1,<25",
+
+    # --- Resilience ---
+    "tenacity>=8.3,<9",
+
+    # --- Long-Term Memory ---
+    "lancedb>=0.6,<1",
+    "pyarrow>=16.0",
+
+    # --- MCP Server (SSE transport) ---
+    "starlette>=0.37,<1",
+    "sse-starlette>=2.0,<3",
+    "uvicorn>=0.29,<1",
+    "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-asyncio>=0.23,<1",
+    "pytest-cov>=5.0,<6",
+    "fakeredis[lua]>=2.23,<3",
+    "ruff>=0.4,<1",
+    "mypy>=1.10,<2",
+]
+
+[project.scripts]
+swarm = "swarm.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swarm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "requires_docker: marks tests that need a running Docker daemon",
+    "requires_redis: marks tests that need a running Redis server",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "A", "SIM", "TCH"]
+ignore = ["ANN101", "ANN102"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]

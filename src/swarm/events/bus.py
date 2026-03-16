@@ -138,6 +138,7 @@ class FileWriteLock:
         self._redis = redis_client
         self._file_path = file_path
         self._lock_key = f"{prefix}:{file_path}"
+        self._reader_key = f"{prefix}:readers:{file_path}"
         self._lock_value = uuid.uuid4().hex  # Unique owner token
         self._timeout_ms = timeout_ms
         self._retry_interval = retry_interval
@@ -145,8 +146,18 @@ class FileWriteLock:
         self._acquired = False
 
     async def acquire(self) -> bool:
-        """Attempt to acquire the lock, retrying up to max_retries."""
+        """Attempt to acquire the write lock, retrying up to max_retries.
+
+        MRSW enforcement: the lock is only granted when both the exclusive
+        write key is free AND the reader counter is zero.
+        """
         for attempt in range(self._max_retries):
+            # MRSW: check reader count first
+            reader_count = await self._redis.get(self._reader_key)
+            if reader_count and int(reader_count) > 0:
+                await asyncio.sleep(self._retry_interval)
+                continue
+
             result = await self._redis.set(
                 self._lock_key,
                 self._lock_value,
@@ -210,6 +221,80 @@ class FileWriteLock:
                 str(additional_ms),
             )
             return bool(result)
+        except Exception:
+            return False
+
+    async def __aenter__(self) -> bool:
+        return await self.acquire()
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.release()
+
+
+# Lua script: decrement reader count, never below zero
+_DECR_READERS_SCRIPT = """
+local current = redis.call("GET", KEYS[1])
+if current and tonumber(current) > 0 then
+    return redis.call("DECR", KEYS[1])
+end
+return 0
+"""
+
+
+class FileReadLock:
+    """Distributed read lock for the MRSW pattern.
+
+    Multiple readers can hold the lock simultaneously.  Uses a Redis
+    counter key (INCR/DECR) with a TTL failsafe.  Writers check this
+    counter before acquiring the exclusive write lock::
+
+        async with bus.file_read_lock("src/api/routes.py") as acquired:
+            if acquired:
+                # Safe to read — writers are blocked
+                content = read_file(...)
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        file_path: str,
+        *,
+        timeout_ms: int = 30_000,
+        prefix: str = "swarm:filelock",
+    ) -> None:
+        self._redis = redis_client
+        self._file_path = file_path
+        self._reader_key = f"{prefix}:readers:{file_path}"
+        self._write_key = f"{prefix}:{file_path}"
+        self._timeout_ms = timeout_ms
+        self._acquired = False
+
+    async def acquire(self) -> bool:
+        """Acquire a read slot — blocks if a writer holds the exclusive lock."""
+        for _ in range(100):
+            # Check if a writer holds the exclusive lock
+            write_held = await self._redis.get(self._write_key)
+            if write_held:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Increment reader count (atomic)
+            await self._redis.incr(self._reader_key)
+            # Set TTL on the reader key as failsafe
+            await self._redis.pexpire(self._reader_key, self._timeout_ms)
+            self._acquired = True
+            return True
+
+        return False
+
+    async def release(self) -> bool:
+        """Release the read slot (decrement reader count)."""
+        if not self._acquired:
+            return False
+        try:
+            await self._redis.eval(_DECR_READERS_SCRIPT, 1, self._reader_key)
+            self._acquired = False
+            return True
         except Exception:
             return False
 
@@ -623,6 +708,38 @@ class EventBus:
             raise RuntimeError("EventBus not connected. Cannot create file lock.")
 
         return FileWriteLock(
+            self._redis,
+            file_path,
+            timeout_ms=timeout_ms,
+            prefix=f"{self._config.stream_prefix}:filelock",
+        )
+
+    def file_read_lock(
+        self,
+        file_path: str,
+        *,
+        timeout_ms: int = 30_000,
+    ) -> FileReadLock:
+        """Create a distributed file read lock (MRSW reader).
+
+        Multiple readers can hold this simultaneously.  Writers are
+        blocked while any reader holds the lock::
+
+            async with bus.file_read_lock("src/main.py") as acquired:
+                if acquired:
+                    content = read_file(...)
+
+        Parameters
+        ----------
+        file_path:
+            Relative path within the workspace.
+        timeout_ms:
+            Auto-release timeout in milliseconds.
+        """
+        if not self._redis:
+            raise RuntimeError("EventBus not connected. Cannot create file read lock.")
+
+        return FileReadLock(
             self._redis,
             file_path,
             timeout_ms=timeout_ms,

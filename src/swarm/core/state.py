@@ -28,6 +28,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -215,11 +219,17 @@ class SwarmState:
         snap = await state.snapshot()
     """
 
-    def __init__(self, swarm_name: str) -> None:
+    def __init__(self, swarm_name: str, *, event_bus: Any | None = None) -> None:
+        # Global lock — only for structural mutations (register, create, snapshot)
         self._lock = asyncio.Lock()
+        # Per-agent locks — for agent-specific updates (status, iterations, tokens)
+        self._agent_locks: dict[str, asyncio.Lock] = {}
         self._session_id: str = uuid.uuid4().hex[:16]
         self._swarm_name: str = swarm_name
         self._created_at: datetime = datetime.now(timezone.utc)
+
+        # Optional EventBus for Event Sourcing (Redis Streams)
+        self._event_bus = event_bus
 
         # Core state stores
         self._tasks: dict[str, TaskRecord] = {}
@@ -231,24 +241,56 @@ class SwarmState:
         # Circuit breaker support: counts per ordered agent pair
         self._pair_message_counts: dict[str, int] = {}
 
+    def _get_agent_lock(self, name: str) -> asyncio.Lock:
+        """Get or create a per-agent lock."""
+        if name not in self._agent_locks:
+            self._agent_locks[name] = asyncio.Lock()
+        return self._agent_locks[name]
+
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    async def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Append a state-change event to the Event Sourcing stream.
+
+        Each event is a delta — the minimum information needed to replay
+        this mutation. The stream key is ``swarm:state_events:<session_id>``.
+        """
+        if self._event_bus is None or not self._event_bus.connected:
+            return
+        try:
+            from swarm.events.bus import SwarmEvent
+            event = SwarmEvent(
+                channel=f"state_events:{self._session_id}",
+                event_type=event_type,
+                sender="state",
+                payload=payload,
+            )
+            await self._event_bus.publish(f"state_events:{self._session_id}", event)
+        except Exception as exc:
+            await logger.warning(
+                "state.event_sourcing_failed",
+                event_type=event_type,
+                error=str(exc),
+            )
 
     # --- Agent management ---
 
     async def register_agent(self, name: str, sandbox_id: str | None = None) -> AgentRecord:
         """Register a new agent in the state. Idempotent on the same name."""
-        async with self._lock:
+        async with self._lock:  # structural: adding a new agent
             if name in self._agents:
                 return self._agents[name]
             record = AgentRecord(name=name, sandbox_id=sandbox_id)
             self._agents[name] = record
-            return record
+            self._agent_locks[name] = asyncio.Lock()
+        await self._emit_event("AGENT_REGISTERED", {"name": name, "sandbox_id": sandbox_id})
+        return record
 
     async def set_agent_status(self, name: str, status: AgentStatus) -> AgentRecord:
         """Transition an agent's status, enforcing valid transitions."""
-        async with self._lock:
+        async with self._get_agent_lock(name):  # per-agent lock
             record = self._agents.get(name)
             if record is None:
                 raise KeyError(f"Unknown agent: '{name}'")
@@ -268,19 +310,21 @@ class SwarmState:
 
             updated = record.model_copy(update=updates)
             self._agents[name] = updated
-            return updated
+        await self._emit_event("AGENT_STATUS_CHANGED", {"name": name, "status": status.value})
+        return updated
 
     async def update_agent_iterations(self, name: str, iterations: int) -> None:
         """Update the iteration count for an agent."""
-        async with self._lock:
+        async with self._get_agent_lock(name):  # per-agent lock
             record = self._agents.get(name)
             if record is None:
                 raise KeyError(f"Unknown agent: '{name}'")
             self._agents[name] = record.model_copy(update={"iterations": iterations})
+        await self._emit_event("AGENT_ITERATIONS_UPDATED", {"name": name, "iterations": iterations})
 
     async def update_agent_tokens(self, name: str, usage: TokenUsage) -> None:
         """Accumulate token usage for an agent."""
-        async with self._lock:
+        async with self._get_agent_lock(name):  # per-agent lock
             record = self._agents.get(name)
             if record is None:
                 raise KeyError(f"Unknown agent: '{name}'")
@@ -291,13 +335,56 @@ class SwarmState:
                 total_tokens=current.total_tokens + usage.total_tokens,
             )
             self._agents[name] = record.model_copy(update={"token_usage": merged})
+        await self._emit_event("AGENT_TOKENS_UPDATED", {
+            "name": name,
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens,
+        })
 
     async def get_agent(self, name: str) -> AgentRecord | None:
         """Get a snapshot of an agent's state (or None)."""
-        async with self._lock:
-            return self._agents.get(name)
+        # Read-only — no lock needed for dict reads in single-threaded asyncio
+        return self._agents.get(name)
 
-    # --- Task management ---
+    async def reset_agent_for_redispatch(self, name: str) -> None:
+        """Reset an agent's counters for re-dispatch as a helper.
+
+        Archives old token usage to a global billing tracker, then resets
+        iterations, token usage, timestamps, and circuit breaker pair counts
+        so the agent starts fresh without tripping budget or stall detection.
+        """
+        async with self._get_agent_lock(name):
+            record = self._agents.get(name)
+            if record is None:
+                raise KeyError(f"Unknown agent: '{name}'")
+
+            # Archive old token usage to global billing context
+            billing = self._context.get("global_billing", {})
+            agent_billing = billing.get(name, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+            agent_billing["prompt_tokens"] += record.token_usage.prompt_tokens
+            agent_billing["completion_tokens"] += record.token_usage.completion_tokens
+            agent_billing["total_tokens"] += record.token_usage.total_tokens
+            billing[name] = agent_billing
+            self._context["global_billing"] = billing
+
+            # Reset agent record for fresh dispatch
+            self._agents[name] = record.model_copy(update={
+                "iterations": 0,
+                "token_usage": TokenUsage(),
+                "started_at": None,
+                "finished_at": None,
+                "current_task_id": None,
+            })
+
+        # Reset circuit breaker pair counters involving this agent
+        async with self._lock:
+            pairs_to_reset = [
+                key for key in self._pair_message_counts
+                if name in key.split("<->")
+            ]
+            for key in pairs_to_reset:
+                self._pair_message_counts[key] = 0
 
     async def create_task(self, name: str, assigned_agent: str) -> str:
         """Create a new task and return its ID."""
@@ -314,6 +401,12 @@ class SwarmState:
             )
 
             return record.task_id
+
+        await self._emit_event("TASK_CREATED", {
+            "task_id": record.task_id, "name": name,
+            "assigned_agent": assigned_agent,
+        })
+        return record.task_id
 
     async def set_task_status(
         self,
@@ -348,7 +441,11 @@ class SwarmState:
 
             updated = record.model_copy(update=updates)
             self._tasks[task_id] = updated
-            return updated
+        await self._emit_event("TASK_STATUS_CHANGED", {
+            "task_id": task_id, "status": status.value,
+            "result": result, "error": error,
+        })
+        return updated
 
     async def get_task(self, task_id: str) -> TaskRecord | None:
         """Get a snapshot of a task (or None)."""
@@ -362,6 +459,12 @@ class SwarmState:
 
     # --- Message ledger ---
 
+    _circuit_breaker_max: int = 5  # default, overridden by config
+
+    def set_circuit_breaker_threshold(self, max_round_trips: int) -> None:
+        """Configure the circuit breaker threshold from config."""
+        self._circuit_breaker_max = max_round_trips
+
     async def add_message(
         self,
         role: MessageRole,
@@ -370,7 +473,14 @@ class SwarmState:
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> Message:
-        """Record a message and increment the pair counter for circuit breaking."""
+        """Record a message and increment the pair counter for circuit breaking.
+
+        When a pair's message count exceeds the circuit breaker threshold,
+        emits a ``CIRCUIT_BREAKER_TRIPPED`` event with the conflicting pair.
+        """
+        tripped_pair: str | None = None
+        pair_count = 0
+
         async with self._lock:
             msg = Message(
                 role=role,
@@ -387,8 +497,33 @@ class SwarmState:
                 self._pair_message_counts[pair_key] = (
                     self._pair_message_counts.get(pair_key, 0) + 1
                 )
+                pair_count = self._pair_message_counts[pair_key]
+                if pair_count >= self._circuit_breaker_max:
+                    tripped_pair = pair_key
 
-            return msg
+        await self._emit_event("MESSAGE_ADDED", {
+            "sender": sender, "recipient": recipient,
+            "role": role.value, "content_length": len(content),
+        })
+
+        # Circuit breaker trip detection
+        if tripped_pair:
+            agents = tripped_pair.split("<->")
+            await logger.warning(
+                "state.circuit_breaker_tripped",
+                pair=tripped_pair,
+                count=pair_count,
+                threshold=self._circuit_breaker_max,
+            )
+            await self._emit_event("CIRCUIT_BREAKER_TRIPPED", {
+                "pair": tripped_pair,
+                "agent_a": agents[0],
+                "agent_b": agents[1],
+                "count": pair_count,
+                "threshold": self._circuit_breaker_max,
+            })
+
+        return msg
 
     async def get_pair_message_count(self, agent_a: str, agent_b: str) -> int:
         """Return the number of messages exchanged between two specific agents."""
@@ -420,6 +555,7 @@ class SwarmState:
         """Register a file artifact produced by an agent."""
         async with self._lock:
             self._artifacts[name] = path
+        await self._emit_event("ARTIFACT_REGISTERED", {"name": name, "path": path})
 
     async def get_artifact(self, name: str) -> str | None:
         """Look up an artifact path by name."""
@@ -432,6 +568,7 @@ class SwarmState:
         """Set an arbitrary key in the execution context."""
         async with self._lock:
             self._context[key] = value
+        await self._emit_event("CONTEXT_SET", {"key": key})
 
     async def get_context(self, key: str, default: Any = None) -> Any:
         """Get a value from the execution context."""

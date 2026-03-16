@@ -122,6 +122,10 @@ class WorkerAgent:
     # Completion signals the agent can emit
     COMPLETION_SIGNALS = {"[TASK_COMPLETE]", "[DONE]", "[FINISHED]"}
 
+    # Token budget per task — stop if exceeded to prevent runaway spending
+    # Now config-driven via AgentConfig.token_budget; this class default is a fallback
+    TOKEN_BUDGET = 50_000
+
     def __init__(
         self,
         *,
@@ -151,6 +155,16 @@ class WorkerAgent:
         self._tool_count = 0
         self._file_writes = 0
         self._file_reads = 0
+        self._budget_warned = False
+
+        # LLM Gateway for fallback routing and caching
+        try:
+            from swarm.core.llm_gateway import LLMGateway
+            self._gateway = LLMGateway(
+                fallback_models=config.fallback_models,
+            )
+        except Exception:
+            self._gateway = None
 
     @property
     def name(self) -> str:
@@ -243,15 +257,19 @@ class WorkerAgent:
 
     async def _run_loop(self, task: str, task_id: str) -> str:
         """The inner agentic loop."""
-        from litellm import acompletion
+        from litellm import acompletion  # fallback if gateway unavailable
 
-        # Add initial task message
+        # Add initial task message with efficiency instructions
         self._messages.append({
             "role": "user",
             "content": (
                 f"Execute the following task:\n\n{task}\n\n"
-                f"When finished, include '[TASK_COMPLETE]' in your response "
-                f"with a summary of what was accomplished."
+                f"**RULES:**\n"
+                f"- Be efficient. Only read files directly relevant to the task.\n"
+                f"- Do NOT scan the entire codebase. Read only what you need.\n"
+                f"- Plan before acting: think → read key files → make changes → verify.\n"
+                f"- Complete in as few iterations as possible.\n"
+                f"- When finished, include '[TASK_COMPLETE]' with a brief summary.\n"
             ),
         })
 
@@ -262,6 +280,44 @@ class WorkerAgent:
 
         while self._iteration < self._config.max_iterations:
             if self._shutdown.is_set():
+                break
+
+            # --- Token budget check ---
+            budget = self._config.token_budget
+            used = self._total_tokens.total_tokens
+
+            # 90% soft warning — inject finalization prompt
+            if used > budget * 0.9 and not getattr(self, '_budget_warned', False):
+                self._budget_warned = True
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM: Token budget warning — you have used "
+                        f"{used:,} of {budget:,} tokens (90%). "
+                        f"Wrap up your current work and finalize immediately."
+                    ),
+                })
+                await logger.warning(
+                    "worker.token_budget_warning",
+                    agent=self.name,
+                    tokens=used,
+                    budget=budget,
+                )
+
+            # 100% hard stop
+            if used > budget:
+                await logger.warning(
+                    "worker.token_budget_exceeded",
+                    agent=self.name,
+                    tokens=used,
+                    budget=budget,
+                )
+                summary = (
+                    f"[TASK_COMPLETE] Stopped — token budget of "
+                    f"{budget:,} reached "
+                    f"({used:,} used). "
+                    f"Work done so far has been saved."
+                )
                 break
 
             self._iteration += 1
@@ -288,7 +344,19 @@ class WorkerAgent:
                     call_kwargs["tools"] = tools
                     call_kwargs["tool_choice"] = "auto"
 
-                response = await acompletion(**call_kwargs)
+                if self._gateway is not None:
+                    response = await self._gateway.complete(
+                        model=self._config.model,
+                        messages=self._messages,
+                        tools=tools if tools else None,
+                        tool_choice="auto" if tools else None,
+                        temperature=self._config.temperature,
+                        max_tokens=4096,
+                        timeout=self._config.timeout_seconds,
+                        agent_name=self.name,
+                    )
+                else:
+                    response = await acompletion(**call_kwargs)
                 consecutive_errors = 0  # Reset on success
 
                 # --- Broadcast LLM call metrics to dashboard ---
@@ -389,12 +457,28 @@ class WorkerAgent:
                             "error": f"Tool execution crashed: {tool_exc}",
                         })
 
+                    # Truncate large tool outputs to save tokens
+                    _MAX_TOOL_OUTPUT_CHARS = 4_000  # ~1K tokens (was 8K)
+                    if len(tool_result) > _MAX_TOOL_OUTPUT_CHARS:
+                        tool_result = (
+                            tool_result[:_MAX_TOOL_OUTPUT_CHARS]
+                            + f"\n\n[OUTPUT TRUNCATED — {len(tool_result):,} chars total, "
+                            f"showing first {_MAX_TOOL_OUTPUT_CHARS:,}]"
+                        )
+
                     # Append tool result
                     self._messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": tool_result,
                     })
+
+                # --- Post-write content scrubbing ---
+                # After write_file tool calls, the full file content sits in
+                # the assistant message's tool_call args. This can be 5K+
+                # tokens for a single file write. Scrub it to prevent
+                # re-sending the entire content on every subsequent LLM call.
+                self._scrub_write_file_content()
 
                 # Log to state
                 await self._state.add_message(
@@ -427,19 +511,69 @@ class WorkerAgent:
                 )
                 break
 
-            # Prompt for continuation
-            self._messages.append({
-                "role": "user",
-                "content": (
-                    "Continue with the task. Use tools as needed. "
-                    "When finished, include '[TASK_COMPLETE]' in your response."
-                ),
-            })
+            # Prompt for continuation with structured self-assessment
+            iteration_pct = self._iteration / self._config.max_iterations
+            if iteration_pct >= 0.8:
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        "SYSTEM: You are approaching the iteration limit "
+                        f"({self._iteration}/{self._config.max_iterations}). "
+                        "Finalize your work immediately. Output your final "
+                        "result and include '[TASK_COMPLETE]' with a summary."
+                    ),
+                })
+            else:
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        "Assess your progress on the task.\n"
+                        "- If the task is COMPLETE and all requirements are met, "
+                        "respond with '[TASK_COMPLETE]' and a brief summary of "
+                        "what was accomplished.\n"
+                        "- If work REMAINS, explain exactly what needs to be "
+                        "done next and proceed with the next step."
+                    ),
+                })
 
         if not summary:
             summary = f"Agent reached iteration limit ({self._config.max_iterations})."
 
         return summary
+
+    # -------------------------------------------------------------------
+    # Post-write content scrubbing (token economy)
+    # -------------------------------------------------------------------
+
+    def _scrub_write_file_content(self) -> None:
+        """Scrub write_file content from stored assistant messages.
+
+        When the LLM calls write_file(path, content), the full file content
+        (often 3-10K tokens) persists in self._messages as the assistant's
+        tool_call arguments. This content gets re-sent to the LLM on EVERY
+        subsequent call, wasting massive tokens.
+
+        This method replaces the full content with a 200-char preview.
+        """
+        for msg in self._messages:
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls or msg.get("role") != "assistant":
+                continue
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                if fn.get("name") != "write_file":
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                    content = args.get("content", "")
+                    if len(content) > 200:
+                        args["content"] = (
+                            content[:200]
+                            + f"\n... [{len(content):,} chars written]"
+                        )
+                        fn["arguments"] = json.dumps(args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     # -------------------------------------------------------------------
     # Tool call execution
@@ -502,7 +636,7 @@ class WorkerAgent:
 
         return json.dumps({
             "success": result.success,
-            "output": (result.output or "")[:8000],
+            "output": (result.output or "")[:4000],  # Match 4K source cap
             "error": result.error or "",
         })
 
@@ -616,15 +750,16 @@ class WorkerAgent:
         total_chars = sum(len(m.get("content") or "") for m in self._messages)
         estimated_tokens = total_chars // 4  # Rough estimate
 
-        # Only compress if over threshold (leave room for the system prompt)
-        threshold = 16_000  # ~16K tokens triggers compression
+        # Compress early to prevent token waste — 6K threshold (~$0.015 on Gemini Pro)
+        threshold = 6_000  # ~6K tokens triggers compression (was 8K→16K)
         if estimated_tokens < threshold:
             return
 
-        # Keep system prompt and last 4 messages, compress the middle
+        # Keep system prompt and last 2 messages, compress the middle
+        # (was last 4 — too much context carried forward)
         system_msg = self._messages[0]
-        recent = self._messages[-4:]
-        middle = self._messages[1:-4]
+        recent = self._messages[-2:]
+        middle = self._messages[1:-2]
 
         if len(middle) < 2:
             return  # Not enough to compress

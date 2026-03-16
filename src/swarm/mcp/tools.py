@@ -138,57 +138,61 @@ class ToolDescriptor(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Map of tool name → (descriptor, input_model_class)
+def _minimize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Strip Pydantic bloat from JSON schemas to save ~50% tokens per LLM call.
+
+    Removes $defs, title, default values, and nested title fields that
+    Pydantic's model_json_schema() adds but LLMs don't need.
+    """
+    clean: dict[str, Any] = {}
+    for k, v in schema.items():
+        if k in ("$defs", "title", "default"):
+            continue
+        if k == "properties" and isinstance(v, dict):
+            clean[k] = {
+                pk: {fk: fv for fk, fv in pv.items() if fk not in ("title", "default")}
+                for pk, pv in v.items()
+            }
+        else:
+            clean[k] = v
+    return clean
+
+
 TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
     "read_file": ToolDescriptor(
         name="read_file",
-        description=(
-            "Read the contents of a file from the shared workspace. "
-            "Returns the file content as text. Supports optional line range."
-        ),
-        parameters=ReadFileInput.model_json_schema(),
+        description="Read a file. Use start_line/end_line for large files.",
+        parameters=_minimize_schema(ReadFileInput.model_json_schema()),
     ),
     "write_file": ToolDescriptor(
         name="write_file",
-        description=(
-            "Write or create a file in the shared workspace. The write is "
-            "safely serialised through the event bus to prevent concurrent "
-            "write corruption from parallel agents."
-        ),
-        parameters=WriteFileInput.model_json_schema(),
+        description="Write/create a file (auto-locked for concurrent safety).",
+        parameters=_minimize_schema(WriteFileInput.model_json_schema()),
     ),
     "list_directory": ToolDescriptor(
         name="list_directory",
-        description=(
-            "List the contents of a directory in the workspace. "
-            "Returns file names, sizes, and types."
-        ),
-        parameters=ListDirectoryInput.model_json_schema(),
+        description="List directory contents (max 50 entries).",
+        parameters=_minimize_schema(ListDirectoryInput.model_json_schema()),
     ),
     "run_command": ToolDescriptor(
         name="run_command",
-        description=(
-            "Execute a shell command inside the agent's sandbox container. "
-            "Returns stdout, stderr, and exit code."
-        ),
-        parameters=RunCommandInput.model_json_schema(),
+        description="Run a shell command. Returns stdout and exit code.",
+        parameters=_minimize_schema(RunCommandInput.model_json_schema()),
     ),
     "git_diff": ToolDescriptor(
         name="git_diff",
-        description="Show git diff of changes in the workspace.",
-        parameters=GitDiffInput.model_json_schema(),
+        description="Show git diff of workspace changes.",
+        parameters=_minimize_schema(GitDiffInput.model_json_schema()),
     ),
     "git_commit": ToolDescriptor(
         name="git_commit",
-        description="Stage files and create a git commit in the workspace.",
-        parameters=GitCommitInput.model_json_schema(),
+        description="Stage files and commit.",
+        parameters=_minimize_schema(GitCommitInput.model_json_schema()),
     ),
     "search_memory": ToolDescriptor(
         name="search_memory",
-        description=(
-            "Search the team's long-term memory for relevant knowledge from "
-            "past sessions: bug fixes, architectural patterns, coding conventions."
-        ),
-        parameters=SearchMemoryInput.model_json_schema(),
+        description="Search team's long-term memory for past knowledge.",
+        parameters=_minimize_schema(SearchMemoryInput.model_json_schema()),
     ),
 }
 
@@ -227,6 +231,8 @@ class ToolExecutor:
         allowed_tools: list[str] | None = None,
         blocked_commands: list[str] | None = None,
         agent_name: str = "unknown",
+        secret_manager: Any | None = None,
+        rate_limits: dict[str, int] | None = None,
     ) -> None:
         self._workspace = workspace.resolve()
         self._event_bus = event_bus
@@ -235,6 +241,12 @@ class ToolExecutor:
         self._allowed = set(allowed_tools or TOOL_DEFINITIONS.keys())
         self._blocked = blocked_commands or []
         self._agent_name = agent_name
+        self._secret_manager = secret_manager
+
+        # Rate limiting: tool_name → max calls per minute
+        self._rate_limits: dict[str, int] = rate_limits or {}
+        # Token bucket internals: tool_name → list of timestamps
+        self._call_timestamps: dict[str, list[float]] = {}
 
         # Dispatch table
         self._handlers: dict[str, Any] = {
@@ -272,18 +284,11 @@ class ToolExecutor:
     async def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         """Execute a tool by name with the given arguments.
 
-        Parameters
-        ----------
-        tool_name:
-            Name of the MCP tool to execute.
-        arguments:
-            Tool-specific arguments (validated against the Pydantic schema).
-
-        Returns
-        -------
-        ToolResult
-            Standardised result with success flag, output, and error.
+        Includes rate limiting (token bucket per-minute) and PII masking
+        of tool output to prevent credential leakage.
         """
+        import time as _time
+
         if tool_name not in self._allowed:
             return ToolResult(
                 success=False,
@@ -297,6 +302,24 @@ class ToolExecutor:
                 error=f"Unknown tool: '{tool_name}'.",
             )
 
+        # --- Rate limiting (token bucket) ---
+        if tool_name in self._rate_limits:
+            max_per_min = self._rate_limits[tool_name]
+            now = _time.time()
+            stamps = self._call_timestamps.setdefault(tool_name, [])
+            # Prune timestamps older than 60s
+            stamps[:] = [t for t in stamps if now - t < 60.0]
+            if len(stamps) >= max_per_min:
+                wait = 60.0 - (now - stamps[0])
+                await logger.warning(
+                    "tool.rate_limited",
+                    tool=tool_name,
+                    agent=self._agent_name,
+                    wait_seconds=round(wait, 1),
+                )
+                await asyncio.sleep(max(wait, 0.5))
+            stamps.append(_time.time())
+
         try:
             result = await handler(arguments)
             await logger.info(
@@ -305,6 +328,16 @@ class ToolExecutor:
                 agent=self._agent_name,
                 success=result.success,
             )
+
+            # --- PII masking ---
+            if self._secret_manager is not None and result.output:
+                result = ToolResult(
+                    success=result.success,
+                    output=self._secret_manager.mask(result.output),
+                    error=result.error,
+                    metadata=result.metadata,
+                )
+
             return result
         except Exception as exc:
             await logger.error(
@@ -320,7 +353,11 @@ class ToolExecutor:
     # -------------------------------------------------------------------
 
     async def _exec_read_file(self, args: dict[str, Any]) -> ToolResult:
-        """Read file contents from the workspace."""
+        """Read file contents from the workspace.
+
+        When the EventBus is connected, acquires a MRSW read lock so
+        that writers are blocked while reading, preventing partial reads.
+        """
         params = ReadFileInput.model_validate(args)
         target = self._resolve_path(params.path)
 
@@ -329,8 +366,18 @@ class ToolExecutor:
         if not target.is_file():
             return ToolResult(success=False, error=f"Not a file: {params.path}")
 
+        # Acquire read lock (MRSW) if event bus is available
+        read_lock = None
+        if self._event_bus is not None and self._event_bus.connected:
+            try:
+                read_lock = self._event_bus.file_read_lock(params.path)
+                await read_lock.acquire()
+            except Exception:
+                read_lock = None  # fall through to unlocked read
+
         try:
             content = target.read_text(encoding="utf-8")
+            total_lines = content.count("\n") + 1
 
             # Apply line range if specified
             if params.start_line or params.end_line:
@@ -339,16 +386,25 @@ class ToolExecutor:
                 end = params.end_line or len(lines)
                 content = "".join(lines[start:end])
 
+            # Cap at 4K chars to prevent context bloat (was unbounded)
+            _MAX = 4_000
+            truncated = len(content) > _MAX
+            if truncated:
+                content = content[:_MAX] + f"\n... [TRUNCATED — {len(content):,} chars total, {total_lines} lines. Use start_line/end_line to read specific sections.]"
+
             return ToolResult(
                 success=True,
                 output=content,
-                metadata={"path": str(target), "size": target.stat().st_size},
+                metadata={"path": str(target), "size": target.stat().st_size, "lines": total_lines},
             )
         except UnicodeDecodeError:
             return ToolResult(
                 success=False,
                 error=f"Cannot read binary file: {params.path}",
             )
+        finally:
+            if read_lock is not None:
+                await read_lock.release()
 
     async def _exec_write_file(self, args: dict[str, Any]) -> ToolResult:
         """Write a file via the Event Bus distributed lock.
@@ -458,8 +514,8 @@ class ToolExecutor:
                         size = item.stat().st_size
                         entries.append(f"{prefix}{rel}  ({size:,} bytes)")
 
-                    if len(entries) > 200:  # Safety cap
-                        entries.append("... (truncated at 200 entries)")
+                    if len(entries) > 50:  # Token-saving cap (was 200)
+                        entries.append("... (truncated at 50 entries)")
                         return
             except PermissionError:
                 entries.append(f"{prefix}[permission denied]")
@@ -487,8 +543,12 @@ class ToolExecutor:
         # Route through sandbox if available
         if self._sandbox_exec is not None:
             try:
+                # Prepend cd if workdir is specified
+                cmd = params.command
+                if params.workdir:
+                    cmd = f"cd {params.workdir} && {cmd}"
                 exit_code, output = await self._sandbox_exec(
-                    params.command, params.timeout,
+                    cmd, params.timeout,
                 )
                 return ToolResult(
                     success=exit_code == 0,
@@ -516,7 +576,7 @@ class ToolExecutor:
 
             return ToolResult(
                 success=exit_code == 0,
-                output=output[-10_000:],  # Cap output length
+                output=output[-2_000:],  # Cap output (was 10K — major token waste)
                 error="" if exit_code == 0 else f"Exit code: {exit_code}",
                 metadata={"exit_code": exit_code},
             )

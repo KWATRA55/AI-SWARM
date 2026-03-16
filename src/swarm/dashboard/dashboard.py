@@ -345,33 +345,49 @@ class SwarmDashboard:
             workspace = Path("/tmp/screener-mvp")
             if self._orchestrator:
                 model = self._orchestrator._config.agents[0].model
-                workspace = self._orchestrator._config.workspace
+                workspace = Path(str(self._orchestrator._config.workspace))
 
             dispatch_fn = None
             if self._orchestrator:
                 dispatch_fn = self._orchestrator.dispatch_dynamic_task
+
+            state = None
+            if self._orchestrator:
+                state = self._orchestrator._state
 
             self._manager_chat = ManagerChat(
                 model=model,
                 workspace=workspace,
                 dispatch_fn=dispatch_fn,
                 dashboard_cb=self.broadcast_event,
+                state=state,
             )
 
         # Send typing indicator
         await self.broadcast_event("manager", "chat_typing", {})
 
-        # Get response
+        # Get response with timeout to prevent silent hangs
         try:
-            response = await self._manager_chat.send_message(message)
+            response = await asyncio.wait_for(
+                self._manager_chat.send_message(message),
+                timeout=120.0,  # 2 minute timeout for manager response
+            )
+        except asyncio.TimeoutError:
+            response = "⏰ Manager response timed out (exceeded 2 minutes). The workspace may be too large for a full scan. Try a more specific request."
+            await logger.error("dashboard.chat_timeout", message=message[:100])
         except Exception as exc:
             response = f"❌ Error: {exc}"
+            await logger.error("dashboard.chat_error", error=str(exc), exc_info=True)
 
         # Broadcast manager response
         await self.broadcast_event("manager", "chat_message", {
             "role": "manager",
             "message": response,
         })
+        await logger.info(
+            "dashboard.chat_response_broadcast",
+            response_length=len(response),
+        )
 
     async def _handle_dispatch(self, cmd: dict[str, Any]) -> None:
         """Handle manual task dispatch from dashboard."""

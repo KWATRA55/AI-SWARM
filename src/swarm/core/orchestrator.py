@@ -272,6 +272,7 @@ class SwarmOrchestrator:
         task: str = "",
         dry_run: bool = False,
         timeout_minutes: float = 0,
+        interactive: bool = False,
     ) -> dict[str, Any]:
         """Execute the full orchestration pipeline.
 
@@ -350,45 +351,62 @@ class SwarmOrchestrator:
             self._manager.set_helper_dispatcher(self._dispatch_helper_agent)
             self._manager_task = await self._manager.start()
 
-            # --- Phase 4: Execute tiers ---
+            # --- Phase 4: Execute tiers (or wait in interactive mode) ---
             tier_results: dict[str, Any] = {}
-            for tier_index, tier in enumerate(self._tiers):
-                if self._shutdown_event.is_set():
-                    await logger.warning("orchestrator.shutdown_requested")
-                    break
 
+            if interactive:
+                # Interactive mode: don't auto-run agents.
+                # The user drives work via the dashboard chat which calls
+                # dispatch_dynamic_task().
                 await logger.info(
-                    "orchestrator.executing_tier",
-                    tier=tier_index,
-                    agents=[a.name for a in tier],
+                    "orchestrator.interactive_mode",
+                    msg="Waiting for user input via dashboard chat.",
                 )
-                await self._broadcast("tier_started", {
-                    "tier": tier_index,
-                    "agents": [a.name for a in tier],
+                await self._broadcast("waiting_for_input", {
+                    "message": "Interactive mode — use the chat to tell the manager what to do.",
+                    "agents": [a.name for a in self._config.agents],
                 })
 
-                # Inject workspace bootstrap for all tiers
-                # (tier 0 gets it too for incremental builds on existing codebases)
-                workspace_ctx = await self._build_workspace_bootstrap()
+                # Block until kill switch or Ctrl-C
+                await self._shutdown_event.wait()
+            else:
+                for tier_index, tier in enumerate(self._tiers):
+                    if self._shutdown_event.is_set():
+                        await logger.warning("orchestrator.shutdown_requested")
+                        break
 
-                results = await self._execute_tier(
-                    tier, task=task, workspace_context=workspace_ctx,
-                )
-                tier_results[f"tier_{tier_index}"] = results
-
-                # Collect tier summaries for inter-agent context
-                tier_summary_parts = []
-                for agent_name, result in results.items():
-                    if isinstance(result, dict):
-                        summary = result.get("result", {}).get("summary", "")
-                        if summary:
-                            tier_summary_parts.append(
-                                f"[{agent_name}]: {summary[:500]}"
-                            )
-                if tier_summary_parts:
-                    self._tier_summaries.append(
-                        "\n".join(tier_summary_parts)
+                    await logger.info(
+                        "orchestrator.executing_tier",
+                        tier=tier_index,
+                        agents=[a.name for a in tier],
                     )
+                    await self._broadcast("tier_started", {
+                        "tier": tier_index,
+                        "agents": [a.name for a in tier],
+                    })
+
+                    # Inject workspace bootstrap for all tiers
+                    # (tier 0 gets it too for incremental builds on existing codebases)
+                    workspace_ctx = await self._build_workspace_bootstrap()
+
+                    results = await self._execute_tier(
+                        tier, task=task, workspace_context=workspace_ctx,
+                    )
+                    tier_results[f"tier_{tier_index}"] = results
+
+                    # Collect tier summaries for inter-agent context
+                    tier_summary_parts = []
+                    for agent_name, result in results.items():
+                        if isinstance(result, dict):
+                            summary = result.get("result", {}).get("summary", "")
+                            if summary:
+                                tier_summary_parts.append(
+                                    f"[{agent_name}]: {summary[:500]}"
+                                )
+                    if tier_summary_parts:
+                        self._tier_summaries.append(
+                            "\n".join(tier_summary_parts)
+                        )
 
             # --- Stop Manager ---
             if self._manager:
@@ -438,6 +456,14 @@ class SwarmOrchestrator:
             self._event_bus = EventBus(self._config.event_bus)
             await self._event_bus.connect()
             await logger.info("orchestrator.eventbus_connected")
+
+            # Wire event bus into state for Event Sourcing (Step 9)
+            self._state._event_bus = self._event_bus
+
+            # Wire circuit breaker threshold from config (Step 12)
+            self._state.set_circuit_breaker_threshold(
+                self._config.circuit_breaker.max_round_trips,
+            )
         except Exception as exc:
             await logger.warning(
                 "orchestrator.eventbus_connect_failed",
@@ -490,12 +516,17 @@ class SwarmOrchestrator:
 
             if self._sandbox_manager is not None:
                 try:
+                    # Merge API key env vars into agent sandbox config
+                    # so create_sandbox() picks them up via sandbox_cfg.env_vars
+                    api_env = inject_sandbox_env(
+                        agent_config.model,
+                        self._config.api_keys or None,
+                    )
+                    if api_env:
+                        agent_config.sandbox.env_vars.update(api_env)
+
                     sandbox_info = await self._sandbox_manager.create_sandbox(
                         agent_config,
-                        env_override=inject_sandbox_env(
-                            agent_config.model,
-                            self._config.api_keys or None,
-                        ),
                     )
                     await logger.info(
                         "orchestrator.sandbox_created",
@@ -972,8 +1003,10 @@ class SwarmOrchestrator:
             "idle_agent": idle_agent, "helping": struggling_agent,
         })
 
-        # Reset agent status so it can run again
+        # Reset agent counters so it doesn't trip budget/stall detection
+        # (archives old token usage to global billing tracker)
         try:
+            await self._state.reset_agent_for_redispatch(idle_agent)
             await self._state.set_agent_status(idle_agent, AgentStatus.IDLE)
         except Exception as exc:
             await logger.warning(
@@ -1094,8 +1127,13 @@ class SwarmOrchestrator:
 
         # Build prompt with workspace context
         workspace_ctx = await self._build_workspace_bootstrap()
+
+        # Cap max_iterations for dynamic tasks to prevent runaway token spend
+        capped_config = agent_config.model_copy(update={
+            "max_iterations": min(agent_config.max_iterations, 15),
+        })
         enhanced_prompt = self._build_enhanced_prompt(
-            agent_config=agent_config,
+            agent_config=capped_config,
             task=task_prompt,
             ltm_context="",
             workspace_context=workspace_ctx,
@@ -1104,15 +1142,25 @@ class SwarmOrchestrator:
 
         try:
             result = await self._run_agent_loop(
-                agent_config=agent_config,
+                agent_config=capped_config,
                 enhanced_prompt=enhanced_prompt,
                 task_id=f"dynamic-{agent_name}-{int(time.time())}",
             )
+            # Mark agent as completed so the Manager stops watching it
+            try:
+                await self._state.set_agent_status(agent_name, AgentStatus.COMPLETED)
+            except Exception:
+                pass
             await self._broadcast("dynamic_task_completed", {
                 "agent": agent_name,
                 "status": result.get("status", "unknown"),
             })
         except Exception as exc:
+            # Mark agent as failed so the Manager stops nudging it
+            try:
+                await self._state.set_agent_status(agent_name, AgentStatus.FAILED)
+            except Exception:
+                pass
             await logger.warning(
                 "orchestrator.dynamic_task_failed",
                 agent=agent_name, error=str(exc),

@@ -57,29 +57,29 @@ class ManagerChat:
         response = await chat.send_message("What needs improvement?")
     """
 
-    SYSTEM_PROMPT = """You are the **Manager** of an AI engineering team. You communicate with the human team lead through this chat.
+    SYSTEM_PROMPT = """You are the **Manager / Architect** of an AI engineering team. You are the user's primary contact on the dashboard.
 
 **Your capabilities:**
-1. **Codebase Analysis**: You can scan and read any file in the workspace to understand the current state of the project.
-2. **Task Assignment**: You can assign tasks to your sub-agents (backend-dev, frontend-dev, db-engineer, qa-engineer) by calling the dispatch function.
-3. **Progress Monitoring**: You can track what each agent has done and report progress.
-4. **Suggestions**: Proactively suggest features, optimizations, bug fixes, and architectural improvements.
+1. **Codebase Analysis**: Scan and read any file in the workspace.
+2. **Task Assignment**: Assign tasks to sub-agents (backend-dev, frontend-dev, db-engineer, qa-engineer, architect) by calling dispatch_task.
+3. **Status Monitoring**: Check agent status with get_agent_status() and proactively report updates.
+4. **Suggestions**: Proactively suggest features, optimizations, bug fixes.
 
-**Communication style:**
-- Be concise and direct — you're a principal engineer
-- Use markdown formatting for readability
-- When suggesting work, break it into actionable tasks
-- When the user asks you to do something, confirm the plan first, then execute
+**Communication rules:**
+- Be concise, direct, and action-oriented
+- When assigning work to multiple agents, dispatch ALL of them in a single response
+- After dispatching, confirm which agents got what tasks
+- When the user asks for status, call get_agent_status() first
+- Proactively report when agents complete or fail
 
 **Available tools:**
-- scan_codebase() — get a full directory tree with file sizes
-- read_file(path) — read a specific file
-- dispatch_task(agent, task_description) — assign work to a sub-agent
-- get_agent_status() — check what agents are doing
+- read_file(path) — read a workspace file
+- dispatch_task(agent, task_description) — assign work to a sub-agent  
+- get_agent_status() — check all agents' current status
 
 **Current workspace:** {workspace}
 
-Always be proactive. If the user says "go ahead", start dispatching tasks immediately."""
+Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again."""
 
     def __init__(
         self,
@@ -88,11 +88,13 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
         workspace: Path,
         dispatch_fn: Callable[..., Coroutine] | None = None,
         dashboard_cb: Callable[..., Coroutine] | None = None,
+        state: Any | None = None,
     ) -> None:
         self._model = model
         self._workspace = workspace
         self._dispatch_fn = dispatch_fn
         self._dashboard_cb = dashboard_cb
+        self._state = state  # SwarmState — for agent status lookups
 
         # Conversation history
         self._messages: list[dict[str, str]] = [{
@@ -100,6 +102,7 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
             "content": self.SYSTEM_PROMPT.format(workspace=workspace),
         }]
         self._message_count = 0
+        self._cached_scan: str | None = None  # Cache codebase scan
 
     def set_dispatch_fn(self, fn: Callable[..., Coroutine]) -> None:
         """Set the function to dispatch tasks to sub-agents."""
@@ -116,18 +119,21 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
         self._message_count += 1
         self._messages.append({"role": "user", "content": user_message})
 
-        # Include codebase context if this is the first message or user asks for scan
-        scan_keywords = {"scan", "look", "analyze", "check", "review", "what", "suggest", "improve", "feature"}
+        # Only scan on first message or explicit scan keywords (not every msg)
+        scan_keywords = {"scan", "rescan", "analyze", "review"}
         should_scan = (
-            self._message_count <= 2
+            self._message_count == 1  # Only first msg, not first 2
             or any(k in user_message.lower() for k in scan_keywords)
         )
 
         if should_scan:
-            codebase_ctx = await self._scan_codebase()
+            if self._cached_scan is None or any(k in user_message.lower() for k in {"rescan"}):
+                await logger.info("manager_chat.scanning_codebase")
+                self._cached_scan = await self._scan_codebase()
+                await logger.info("manager_chat.scan_complete", ctx_length=len(self._cached_scan))
             self._messages.append({
                 "role": "system",
-                "content": f"--- CODEBASE SNAPSHOT ---\n{codebase_ctx}\n--- END SNAPSHOT ---",
+                "content": f"--- CODEBASE SNAPSHOT ---\n{self._cached_scan}\n--- END SNAPSHOT ---",
             })
 
         # Define tools the manager can call
@@ -153,7 +159,7 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                 "type": "function",
                 "function": {
                     "name": "dispatch_task",
-                    "description": "Assign a task to a sub-agent. Available agents: backend-dev, frontend-dev, db-engineer, qa-engineer",
+                    "description": "Assign a task to a sub-agent. Available agents: architect, backend-dev, frontend-dev, db-engineer, qa-engineer",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -170,66 +176,97 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_agent_status",
+                    "description": "Get the current status of all agents — running, completed, failed, idle",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            },
         ]
 
-        try:
-            response = await litellm.acompletion(
-                model=self._model,
-                messages=self._messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.3,
-            )
-        except Exception as exc:
-            error_msg = f"❌ Manager LLM error: {exc}"
-            await logger.error("manager_chat.llm_failed", error=str(exc))
-            return error_msg
-
-        choice = response.choices[0]
-        message = choice.message
-
-        # Handle tool calls
-        if message.tool_calls:
-            self._messages.append(message.model_dump())
-
-            for tool_call in message.tool_calls:
-                fn_name = tool_call.function.name
-                import json
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
-
-                result = await self._execute_tool(fn_name, args)
-                self._messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                })
-
-            # Get the final response after tool use
+        # Multi-round tool calling loop
+        max_rounds = 10
+        content = ""
+        for round_num in range(max_rounds):
             try:
-                response2 = await litellm.acompletion(
+                response = await litellm.acompletion(
                     model=self._model,
                     messages=self._messages,
+                    tools=tools,
+                    tool_choice="auto",
                     temperature=0.3,
                 )
-                content = response2.choices[0].message.content or ""
             except Exception as exc:
-                content = f"Manager processed tools but follow-up failed: {exc}"
-        else:
-            content = message.content or ""
+                error_msg = f"❌ Manager LLM error: {exc}"
+                await logger.error("manager_chat.llm_failed", error=str(exc), round=round_num)
+                return error_msg
+
+            choice = response.choices[0]
+            message = choice.message
+
+            await logger.info(
+                "manager_chat.llm_response",
+                round=round_num,
+                has_tool_calls=bool(message.tool_calls),
+                content_length=len(message.content or ""),
+            )
+
+            if message.tool_calls:
+                self._messages.append(message.model_dump())
+
+                for tool_call in message.tool_calls:
+                    fn_name = tool_call.function.name
+                    import json
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    result = await self._execute_tool(fn_name, args)
+                    await logger.info(
+                        "manager_chat.tool_executed",
+                        tool=fn_name,
+                        result_length=len(result),
+                    )
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    })
+                # Continue loop — LLM needs to process tool results
+                continue
+            else:
+                content = message.content or ""
+                break
+
+        # If all rounds were tool calls, force a final text response
+        if not content:
+            await logger.warning(
+                "manager_chat.forcing_text_response",
+                rounds_exhausted=max_rounds,
+            )
+            try:
+                final_response = await litellm.acompletion(
+                    model=self._model,
+                    messages=self._messages,
+                    tool_choice="none",  # Force text, no tools
+                    temperature=0.3,
+                )
+                content = final_response.choices[0].message.content or ""
+            except Exception as exc:
+                content = f"I analyzed the codebase but ran out of processing rounds. Error: {exc}"
+                await logger.error("manager_chat.force_text_failed", error=str(exc))
 
         self._messages.append({"role": "assistant", "content": content})
 
-        # Broadcast to dashboard
-        if self._dashboard_cb:
-            try:
-                await self._dashboard_cb("manager_chat", "response", {
-                    "message": content[:500],
-                })
-            except Exception:
-                pass
+        # NOTE: Do NOT broadcast here — dashboard.py handles broadcasting
+        # the manager response after calling send_message(). Broadcasting
+        # here too causes duplicate messages in the chat.
 
         return content
 
@@ -242,10 +279,12 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
                 args.get("agent", ""),
                 args.get("task_description", ""),
             )
+        elif name == "get_agent_status":
+            return await self._get_agent_status()
         return f"Unknown tool: {name}"
 
     async def _scan_codebase(self) -> str:
-        """Scan the workspace and return a directory tree."""
+        """Scan the workspace — lightweight file list (no sizes to save tokens)."""
         lines: list[str] = []
         file_count = 0
 
@@ -253,9 +292,11 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
             dirs[:] = [
                 d for d in dirs
                 if d not in {'.git', '.venv', 'node_modules', '__pycache__',
-                             '.swarm_memory', '.next'}
+                             '.swarm_memory', '.next', 'dist', 'build'}
             ]
             level = root.replace(str(self._workspace), '').count(os.sep)
+            if level > 3:  # Max depth 3 to keep scan lean
+                continue
             indent = '  ' * level
             basename = os.path.basename(root) or str(self._workspace)
             lines.append(f"{indent}{basename}/")
@@ -264,19 +305,13 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
             for f in sorted(files):
                 if f.startswith('.'):
                     continue
-                filepath = os.path.join(root, f)
-                try:
-                    size = os.path.getsize(filepath)
-                    lines.append(f"{sub_indent}{f}  ({size:,} bytes)")
-                    file_count += 1
-                except OSError:
-                    lines.append(f"{sub_indent}{f}")
-                    file_count += 1
+                lines.append(f"{sub_indent}{f}")
+                file_count += 1
 
-                if file_count > 150:
+                if file_count > 30:  # Strict cap (was 150 — massive token waste)
+                    lines.append("  ... (truncated at 30 files)")
                     break
-            if file_count > 150:
-                lines.append("  ... (truncated at 150 files)")
+            if file_count > 30:
                 break
 
         return '\n'.join(lines) if lines else '(empty workspace)'
@@ -310,6 +345,25 @@ Always be proactive. If the user says "go ahead", start dispatching tasks immedi
             return f"✅ Task dispatched to {agent}: {task[:200]}"
         except Exception as exc:
             return f"❌ Failed to dispatch to {agent}: {exc}"
+
+    async def _get_agent_status(self) -> str:
+        """Get current status of all agents from SwarmState."""
+        if self._state is None:
+            return "Agent status not available — state not connected"
+
+        try:
+            snapshot = await self._state.snapshot()
+            lines: list[str] = []
+            for name, agent in snapshot.agents.items():
+                status = agent.status.value if hasattr(agent.status, 'value') else str(agent.status)
+                lines.append(
+                    f"• {name}: {status} | "
+                    f"iter={agent.iterations} | "
+                    f"tokens={agent.token_usage.total_tokens}"
+                )
+            return "\n".join(lines) if lines else "No agents registered yet"
+        except Exception as exc:
+            return f"Error getting agent status: {exc}"
 
     @property
     def message_count(self) -> int:

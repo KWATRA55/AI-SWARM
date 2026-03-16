@@ -177,6 +177,14 @@ def run(
         False, "--dashboard", "-d",
         help="Launch the real-time dashboard UI at http://localhost:8080.",
     ),
+    interactive: bool = typer.Option(
+        False, "--interactive", "-i",
+        help="Start dashboard and wait for user chat — don't auto-run agents.",
+    ),
+    target: Optional[Path] = typer.Option(
+        None, "--target",
+        help="External project directory for agents to operate on (overrides workspace).",
+    ),
 ) -> None:
     """🚀 Run the swarm orchestration engine."""
     from swarm.config.loader import load_config
@@ -186,7 +194,7 @@ def run(
 
     # --- Load config ---
     try:
-        config = load_config(config_path)
+        config = load_config(config_path, workspace_override=target)
     except Exception as exc:
         typer.secho(f"❌ Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -221,6 +229,7 @@ def run(
         asyncio.run(_execute_swarm(
             config, dry_run=dry_run, timeout_minutes=timeout,
             enable_dashboard=dashboard,
+            interactive=interactive,
         ))
     except KeyboardInterrupt:
         typer.secho("\n⚠️  Interrupted by user. Running teardown...", fg=typer.colors.YELLOW)
@@ -237,6 +246,7 @@ async def _execute_swarm(
     dry_run: bool,
     timeout_minutes: float = 0,
     enable_dashboard: bool = False,
+    interactive: bool = False,
 ) -> None:
     """Async entrypoint that wires up and runs the orchestrator."""
     import structlog
@@ -291,6 +301,14 @@ async def _execute_swarm(
             if key != "tiers":
                 typer.echo(f"   {key}: {value}")
     else:
+        if interactive:
+            typer.secho(
+                "🧑‍💻 Interactive mode — agents will NOT auto-start.",
+                fg=typer.colors.BRIGHT_CYAN, bold=True,
+            )
+            typer.echo("   Use the dashboard chat to tell the manager what to do.")
+            typer.echo()
+
         if timeout_minutes > 0:
             await logger.info(
                 "cli.starting_with_timeout",
@@ -300,7 +318,10 @@ async def _execute_swarm(
         else:
             await logger.info("cli.starting", config=config.name)
 
-        report = await orchestrator.run(timeout_minutes=timeout_minutes)
+        report = await orchestrator.run(
+            timeout_minutes=timeout_minutes,
+            interactive=interactive,
+        )
         await logger.info("cli.completed", report=report)
 
         typer.secho("✅ Swarm execution complete", fg=typer.colors.GREEN, bold=True)

@@ -330,9 +330,6 @@ class WorkerAgent:
             # --- Check for pending interrupts ---
             await self._process_interrupts()
 
-            # --- Check and compress context if needed ---
-            await self._maybe_compress_context()
-
             # --- Call LLM ---
             try:
                 call_kwargs: dict[str, Any] = {
@@ -436,6 +433,11 @@ class WorkerAgent:
                     total_tokens=self._total_tokens.total_tokens + usage.total_tokens,
                 )
                 await self._state.update_agent_tokens(self.name, usage)
+
+            # --- Compress context AFTER we have real prompt_tokens ---
+            # (Must be here, not top-of-loop, because _last_prompt_tokens
+            #  is only set from the response we just received.)
+            await self._maybe_compress_context()
 
             # --- Process response ---
             choice = response.choices[0]

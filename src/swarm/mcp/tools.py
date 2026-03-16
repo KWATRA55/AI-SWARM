@@ -179,16 +179,6 @@ TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
         description="Run a shell command. Returns stdout and exit code.",
         parameters=_minimize_schema(RunCommandInput.model_json_schema()),
     ),
-    "git_diff": ToolDescriptor(
-        name="git_diff",
-        description="Show git diff of workspace changes.",
-        parameters=_minimize_schema(GitDiffInput.model_json_schema()),
-    ),
-    "git_commit": ToolDescriptor(
-        name="git_commit",
-        description="Stage files and commit.",
-        parameters=_minimize_schema(GitCommitInput.model_json_schema()),
-    ),
     "search_memory": ToolDescriptor(
         name="search_memory",
         description="Search team's long-term memory for past knowledge.",

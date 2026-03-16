@@ -80,7 +80,8 @@ class ManagerChat:
 **Current workspace:** {workspace}
 
 Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again.
-IMPORTANT: When assigning write-heavy tasks, instruct agents to batch-write ALL files in a single response using multiple tool calls, NOT one file at a time."""
+IMPORTANT: When assigning write-heavy tasks, instruct agents to batch-write ALL files in a single response using multiple tool calls, NOT one file at a time.
+CRITICAL: If the user's message is vague, a greeting, or doesn't describe a specific task (e.g. 'hello', 'hi', 'hey'), do NOT dispatch any agents. Instead, respond conversationally and ask what they'd like to work on. Only dispatch agents when the user has clearly described a task or feature to build."""
 
     def __init__(
         self,

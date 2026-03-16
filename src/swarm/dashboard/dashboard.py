@@ -355,12 +355,17 @@ class SwarmDashboard:
             if self._orchestrator:
                 state = self._orchestrator._state
 
+            ledger = None
+            if self._orchestrator:
+                ledger = getattr(self._orchestrator, '_ledger', None)
+
             self._manager_chat = ManagerChat(
                 model=model,
                 workspace=workspace,
                 dispatch_fn=dispatch_fn,
                 dashboard_cb=self.broadcast_event,
                 state=state,
+                ledger=ledger,
             )
 
         # Send typing indicator

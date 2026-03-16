@@ -138,7 +138,11 @@ class SwarmManager:
                 if self._shutdown.is_set():
                     break
                 await self._check_progress()
-                await self._check_for_idle_helpers()
+                # NOTE: Auto-helper dispatch disabled — too wasteful.
+                # Completed agents were being re-dispatched with vague prompts,
+                # burning 100k+ tokens reading the entire codebase.
+                # Helpers should only be dispatched explicitly via Manager chat.
+                # await self._check_for_idle_helpers()
         except asyncio.CancelledError:
             pass
 

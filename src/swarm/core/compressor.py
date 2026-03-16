@@ -66,6 +66,9 @@ from swarm.config.models import CompressionConfig, MemoryConfig
 
 logger = structlog.get_logger(__name__)
 
+# Embedding dimension for the default model (gemini/text-embedding-004)
+EMBEDDING_DIM = 768
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -393,6 +396,36 @@ class Compressor:
             Any errors encountered during execution.
         """
         if not self._mem_cfg.enabled or not self._mem_cfg.auto_extract:
+            return ExtractionResult(
+                entries=[],
+                extraction_model=self._mem_cfg.extraction_model,
+                extraction_time_seconds=0.0,
+                task_name=task_name,
+                agent_name=agent_name,
+            )
+
+        # --- Pre-flight heuristic: skip trivial tasks ---
+        # A task is trivial when the conversation is short, error-free, and
+        # consumed minimal tokens. Extracting knowledge from these wastes ~4k
+        # tokens per invocation on zero-value entries.
+        total_msg_tokens = sum(
+            len(m.get("content", "").split()) * 1.3  # rough token estimate
+            for m in conversation_history
+        )
+        is_trivial = (
+            len(conversation_history) <= 5
+            and not task_errors
+            and total_msg_tokens < 5_000
+        )
+        if is_trivial:
+            await logger.info(
+                "compressor.extraction_skipped",
+                agent=agent_name,
+                task=task_name,
+                reason="trivial_task",
+                messages=len(conversation_history),
+                estimated_tokens=int(total_msg_tokens),
+            )
             return ExtractionResult(
                 entries=[],
                 extraction_model=self._mem_cfg.extraction_model,
@@ -851,4 +884,4 @@ CONVERSATION HISTORY:
                 msg="Using zero vector fallback.",
             )
             # Return a zero vector as fallback (won't match anything well)
-            return [0.0] * 1536  # text-embedding-3-small dimension
+            return [0.0] * EMBEDDING_DIM  # gemini/text-embedding-004 dimension

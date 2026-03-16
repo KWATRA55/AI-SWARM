@@ -55,7 +55,9 @@ port mapping so the MCP layer (Phase 5) can connect seamlessly.
 from __future__ import annotations
 
 import asyncio
+import functools
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import structlog
@@ -64,6 +66,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from swarm.config.models import AgentConfig, MCPTransport, SwarmConfig
 
 logger = structlog.get_logger(__name__)
+
+# Dedicated executor for Docker SDK calls — keeps them off the async event loop
+_docker_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="docker")
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +186,17 @@ class SandboxManager:
         from docker.errors import DockerException
 
         try:
-            self._client = docker.from_env()
-            self._client.ping()
+            loop = asyncio.get_event_loop()
+            self._client = await loop.run_in_executor(
+                _docker_executor, docker.from_env,
+            )
+            await loop.run_in_executor(_docker_executor, self._client.ping)
+            version_info = await loop.run_in_executor(
+                _docker_executor, self._client.version,
+            )
             await logger.info(
                 "sandbox.docker_connected",
-                version=self._client.version().get("Version", "unknown"),
+                version=version_info.get("Version", "unknown"),
             )
         except DockerException as exc:
             raise RuntimeError(
@@ -194,10 +205,14 @@ class SandboxManager:
 
         # Create an isolated bridge network for this swarm session
         try:
-            self._network = self._client.networks.create(
-                self._network_name,
-                driver="bridge",
-                labels={"swarm.session": self._config.name},
+            self._network = await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(
+                    self._client.networks.create,
+                    self._network_name,
+                    driver="bridge",
+                    labels={"swarm.session": self._config.name},
+                ),
             )
             await logger.info(
                 "sandbox.network_created",
@@ -210,6 +225,65 @@ class SandboxManager:
                 msg="Falling back to default bridge network.",
             )
             self._network = None
+
+        # Clean up orphan containers from a previous crashed session
+        await self._cleanup_orphans()
+
+    async def _cleanup_orphans(self) -> None:
+        """Remove Docker containers left behind by a previous crashed session.
+
+        Queries all containers labelled ``swarm.agent`` and force-removes any
+        whose ``swarm.session`` label does not match the current session name.
+        This runs once at boot before any new containers are created.
+        """
+        if self._client is None:
+            return
+
+        loop = asyncio.get_event_loop()
+        try:
+            all_swarm_containers = await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(
+                    self._client.containers.list,
+                    filters={"label": "swarm.agent"},
+                    all=True,
+                ),
+            )
+        except Exception as exc:
+            await logger.warning(
+                "sandbox.orphan_scan_failed", error=str(exc),
+            )
+            return
+
+        current_session = self._config.name
+        orphans_removed = 0
+
+        for container in all_swarm_containers:
+            session_label = container.labels.get("swarm.session", "")
+            if session_label != current_session:
+                try:
+                    await loop.run_in_executor(
+                        _docker_executor,
+                        functools.partial(container.remove, force=True),
+                    )
+                    orphans_removed += 1
+                    await logger.info(
+                        "sandbox.orphan_removed",
+                        container=container.name,
+                        stale_session=session_label,
+                    )
+                except Exception as exc:
+                    await logger.warning(
+                        "sandbox.orphan_remove_failed",
+                        container=container.name,
+                        error=str(exc),
+                    )
+
+        if orphans_removed > 0:
+            await logger.info(
+                "sandbox.orphan_cleanup_complete",
+                removed=orphans_removed,
+            )
 
     # -------------------------------------------------------------------
     # Container lifecycle
@@ -304,25 +378,30 @@ class SandboxManager:
         nano_cpus = int(sandbox_cfg.resources.cpu_count * 1e9)
 
         # --- 6. Create the container ---
+        loop = asyncio.get_event_loop()
         try:
-            container = self._client.containers.create(
-                image=sandbox_cfg.image,
-                name=container_name,
-                command="sleep infinity",  # Keep alive; agents run via exec
-                working_dir=self.CONTAINER_WORKSPACE_PATH,
-                volumes=volumes,
-                ports=port_bindings,
-                environment=environment,
-                mem_limit=mem_limit,
-                nano_cpus=nano_cpus,
-                labels={
-                    "swarm.agent": agent_config.name,
-                    "swarm.role": agent_config.role.value,
-                    "swarm.session": self._config.name,
-                },
-                detach=True,
-                tty=True,
-                stdin_open=True,
+            container = await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(
+                    self._client.containers.create,
+                    image=sandbox_cfg.image,
+                    name=container_name,
+                    command="sleep infinity",
+                    working_dir=self.CONTAINER_WORKSPACE_PATH,
+                    volumes=volumes,
+                    ports=port_bindings,
+                    environment=environment,
+                    mem_limit=mem_limit,
+                    nano_cpus=nano_cpus,
+                    labels={
+                        "swarm.agent": agent_config.name,
+                        "swarm.role": agent_config.role.value,
+                        "swarm.session": self._config.name,
+                    },
+                    detach=True,
+                    tty=True,
+                    stdin_open=True,
+                ),
             )
         except Exception as exc:
             await logger.error(
@@ -335,7 +414,10 @@ class SandboxManager:
         # --- 7. Attach to swarm network ---
         if self._network is not None:
             try:
-                self._network.connect(container)
+                await loop.run_in_executor(
+                    _docker_executor,
+                    functools.partial(self._network.connect, container),
+                )
             except Exception as exc:
                 await logger.warning(
                     "sandbox.network_attach_failed",
@@ -345,9 +427,12 @@ class SandboxManager:
 
         # --- 8. Start the container ---
         try:
-            container.start()
+            await loop.run_in_executor(_docker_executor, container.start)
         except Exception as exc:
-            container.remove(force=True)
+            await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(container.remove, force=True),
+            )
             raise RuntimeError(f"Failed to start container for {agent_config.name}: {exc}") from exc
 
         # --- 9. Build sandbox info ---
@@ -393,10 +478,20 @@ class SandboxManager:
         if self._client is None:
             return
 
+        loop = asyncio.get_event_loop()
         try:
-            container = self._client.containers.get(info.container_id)
-            container.stop(timeout=10)
-            container.remove(force=True)
+            container = await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(self._client.containers.get, info.container_id),
+            )
+            await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(container.stop, timeout=10),
+            )
+            await loop.run_in_executor(
+                _docker_executor,
+                functools.partial(container.remove, force=True),
+            )
             await logger.info(
                 "sandbox.destroyed",
                 sandbox_id=sandbox_id,
@@ -434,7 +529,8 @@ class SandboxManager:
         # Remove the swarm network
         if self._network is not None:
             try:
-                self._network.remove()
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(_docker_executor, self._network.remove)
                 await logger.info("sandbox.network_removed", network=self._network_name)
             except Exception as exc:
                 await logger.warning(
@@ -480,9 +576,13 @@ class SandboxManager:
         if self._client is None:
             raise RuntimeError("Docker client not initialized.")
 
-        container = self._client.containers.get(info.container_id)
+        loop = asyncio.get_event_loop()
+        container = await loop.run_in_executor(
+            _docker_executor,
+            functools.partial(self._client.containers.get, info.container_id),
+        )
 
-        # Run in a thread to avoid blocking the event loop
+        # Run in the dedicated Docker executor to avoid blocking the event loop
         def _exec() -> tuple[int, str]:
             exec_result = container.exec_run(
                 cmd=["sh", "-c", command],
@@ -494,7 +594,7 @@ class SandboxManager:
 
         try:
             exit_code, output = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, _exec),
+                loop.run_in_executor(_docker_executor, _exec),
                 timeout=timeout,
             )
             return exit_code, output
@@ -518,10 +618,16 @@ class SandboxManager:
         async with self._lock:
             sandbox_items = list(self._sandboxes.items())
 
+        loop = asyncio.get_event_loop()
         for sandbox_id, info in sandbox_items:
             try:
                 if self._client:
-                    container = self._client.containers.get(info.container_id)
+                    container = await loop.run_in_executor(
+                        _docker_executor,
+                        functools.partial(
+                            self._client.containers.get, info.container_id,
+                        ),
+                    )
                     status = container.status  # "running", "exited", etc.
                     results[sandbox_id] = status
 
@@ -571,8 +677,9 @@ class SandboxManager:
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(
-                    None,
-                    lambda: self._client.images.build(
+                    _docker_executor,
+                    functools.partial(
+                        self._client.images.build,
                         path=".",
                         dockerfile=dockerfile,
                         tag=image,
@@ -583,14 +690,18 @@ class SandboxManager:
         else:
             # Pull from registry
             try:
-                self._client.images.get(image)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    _docker_executor,
+                    functools.partial(self._client.images.get, image),
+                )
                 await logger.info("sandbox.image_found_locally", image=image)
             except Exception:
                 await logger.info("sandbox.pulling_image", image=image)
                 try:
-                    loop = asyncio.get_event_loop()
                     await loop.run_in_executor(
-                        None, lambda: self._client.images.pull(image),
+                        _docker_executor,
+                        functools.partial(self._client.images.pull, image),
                     )
                     await logger.info("sandbox.image_pulled", image=image)
                 except Exception as exc:

@@ -159,6 +159,9 @@ def load_config(
     # --- 6. Post-process: inject shared workspace into every sandbox ---
     config = _inject_workspace_mounts(config)
 
+    # --- 7. Resolve template variables in system prompts ---
+    config = _resolve_template_vars(config)
+
     return config
 
 
@@ -200,6 +203,38 @@ def _inject_workspace_mounts(config: SwarmConfig) -> SwarmConfig:
             updated_agents.append(agent)
 
     if updated_agents != list(config.agents):
+        config = config.model_copy(update={"agents": updated_agents})
+
+    return config
+
+
+def _resolve_template_vars(config: SwarmConfig) -> SwarmConfig:
+    """Replace ``{{variable}}`` placeholders in agent system prompts.
+
+    Supported variables:
+    - ``{{workspace}}``     — absolute workspace path
+    - ``{{project_name}}``  — basename of the workspace directory
+    - ``{{swarm_name}}``    — name of the swarm from the config
+    """
+    replacements = {
+        "{{workspace}}": config.workspace,
+        "{{project_name}}": Path(config.workspace).name,
+        "{{swarm_name}}": config.name,
+    }
+
+    updated_agents = []
+    changed = False
+    for agent in config.agents:
+        prompt = agent.system_prompt
+        for placeholder, value in replacements.items():
+            prompt = prompt.replace(placeholder, value)
+        if prompt != agent.system_prompt:
+            updated_agents.append(agent.model_copy(update={"system_prompt": prompt}))
+            changed = True
+        else:
+            updated_agents.append(agent)
+
+    if changed:
         config = config.model_copy(update={"agents": updated_agents})
 
     return config

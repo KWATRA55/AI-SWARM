@@ -230,14 +230,9 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
 
         self._messages.append({"role": "assistant", "content": content})
 
-        # Broadcast to dashboard
-        if self._dashboard_cb:
-            try:
-                await self._dashboard_cb("manager_chat", "response", {
-                    "message": content[:500],
-                })
-            except Exception:
-                pass
+        # NOTE: Do NOT broadcast here — dashboard.py handles broadcasting
+        # the manager response after calling send_message(). Broadcasting
+        # here too causes duplicate messages in the chat.
 
         return content
 

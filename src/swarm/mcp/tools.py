@@ -227,6 +227,8 @@ class ToolExecutor:
         allowed_tools: list[str] | None = None,
         blocked_commands: list[str] | None = None,
         agent_name: str = "unknown",
+        secret_manager: Any | None = None,
+        rate_limits: dict[str, int] | None = None,
     ) -> None:
         self._workspace = workspace.resolve()
         self._event_bus = event_bus
@@ -235,6 +237,12 @@ class ToolExecutor:
         self._allowed = set(allowed_tools or TOOL_DEFINITIONS.keys())
         self._blocked = blocked_commands or []
         self._agent_name = agent_name
+        self._secret_manager = secret_manager
+
+        # Rate limiting: tool_name → max calls per minute
+        self._rate_limits: dict[str, int] = rate_limits or {}
+        # Token bucket internals: tool_name → list of timestamps
+        self._call_timestamps: dict[str, list[float]] = {}
 
         # Dispatch table
         self._handlers: dict[str, Any] = {
@@ -272,18 +280,11 @@ class ToolExecutor:
     async def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         """Execute a tool by name with the given arguments.
 
-        Parameters
-        ----------
-        tool_name:
-            Name of the MCP tool to execute.
-        arguments:
-            Tool-specific arguments (validated against the Pydantic schema).
-
-        Returns
-        -------
-        ToolResult
-            Standardised result with success flag, output, and error.
+        Includes rate limiting (token bucket per-minute) and PII masking
+        of tool output to prevent credential leakage.
         """
+        import time as _time
+
         if tool_name not in self._allowed:
             return ToolResult(
                 success=False,
@@ -297,6 +298,24 @@ class ToolExecutor:
                 error=f"Unknown tool: '{tool_name}'.",
             )
 
+        # --- Rate limiting (token bucket) ---
+        if tool_name in self._rate_limits:
+            max_per_min = self._rate_limits[tool_name]
+            now = _time.time()
+            stamps = self._call_timestamps.setdefault(tool_name, [])
+            # Prune timestamps older than 60s
+            stamps[:] = [t for t in stamps if now - t < 60.0]
+            if len(stamps) >= max_per_min:
+                wait = 60.0 - (now - stamps[0])
+                await logger.warning(
+                    "tool.rate_limited",
+                    tool=tool_name,
+                    agent=self._agent_name,
+                    wait_seconds=round(wait, 1),
+                )
+                await asyncio.sleep(max(wait, 0.5))
+            stamps.append(_time.time())
+
         try:
             result = await handler(arguments)
             await logger.info(
@@ -305,6 +324,16 @@ class ToolExecutor:
                 agent=self._agent_name,
                 success=result.success,
             )
+
+            # --- PII masking ---
+            if self._secret_manager is not None and result.output:
+                result = ToolResult(
+                    success=result.success,
+                    output=self._secret_manager.mask(result.output),
+                    error=result.error,
+                    metadata=result.metadata,
+                )
+
             return result
         except Exception as exc:
             await logger.error(
@@ -320,7 +349,11 @@ class ToolExecutor:
     # -------------------------------------------------------------------
 
     async def _exec_read_file(self, args: dict[str, Any]) -> ToolResult:
-        """Read file contents from the workspace."""
+        """Read file contents from the workspace.
+
+        When the EventBus is connected, acquires a MRSW read lock so
+        that writers are blocked while reading, preventing partial reads.
+        """
         params = ReadFileInput.model_validate(args)
         target = self._resolve_path(params.path)
 
@@ -328,6 +361,15 @@ class ToolExecutor:
             return ToolResult(success=False, error=f"File not found: {params.path}")
         if not target.is_file():
             return ToolResult(success=False, error=f"Not a file: {params.path}")
+
+        # Acquire read lock (MRSW) if event bus is available
+        read_lock = None
+        if self._event_bus is not None and self._event_bus.connected:
+            try:
+                read_lock = self._event_bus.file_read_lock(params.path)
+                await read_lock.acquire()
+            except Exception:
+                read_lock = None  # fall through to unlocked read
 
         try:
             content = target.read_text(encoding="utf-8")
@@ -349,6 +391,9 @@ class ToolExecutor:
                 success=False,
                 error=f"Cannot read binary file: {params.path}",
             )
+        finally:
+            if read_lock is not None:
+                await read_lock.release()
 
     async def _exec_write_file(self, args: dict[str, Any]) -> ToolResult:
         """Write a file via the Event Bus distributed lock.

@@ -275,7 +275,7 @@ class MemoryConfig(BaseModel):
         description="Vector store backend: 'lancedb' (local, zero-config).",
     )
     embedding_model: str = Field(
-        default="text-embedding-3-small",
+        default="gemini/text-embedding-004",
         description=(
             "litellm-compatible embedding model for vectorising memories. "
             "Used for similarity search during retrieval."
@@ -494,6 +494,23 @@ class AgentConfig(BaseModel):
         default=600.0,
         ge=10.0,
         description="Hard wall-clock timeout for this agent's execution.",
+    )
+    token_budget: int = Field(
+        default=50_000,
+        ge=1_000,
+        description=(
+            "Maximum token spend per task. At 90% a soft warning is injected; "
+            "at 100% the agent is force-stopped. Set per-role: e.g. 100000 "
+            "for architect, 25000 for QA."
+        ),
+    )
+    fallback_models: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ordered fallback model chain for the LLM Gateway. When the primary "
+            "model returns 429/503, the gateway tries each fallback in order. "
+            "Example: ['anthropic/claude-3.5-sonnet', 'ollama/qwen']."
+        ),
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,

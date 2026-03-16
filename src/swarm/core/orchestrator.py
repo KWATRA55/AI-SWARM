@@ -508,12 +508,17 @@ class SwarmOrchestrator:
 
             if self._sandbox_manager is not None:
                 try:
+                    # Merge API key env vars into agent sandbox config
+                    # so create_sandbox() picks them up via sandbox_cfg.env_vars
+                    api_env = inject_sandbox_env(
+                        agent_config.model,
+                        self._config.api_keys or None,
+                    )
+                    if api_env:
+                        agent_config.sandbox.env_vars.update(api_env)
+
                     sandbox_info = await self._sandbox_manager.create_sandbox(
                         agent_config,
-                        env_override=inject_sandbox_env(
-                            agent_config.model,
-                            self._config.api_keys or None,
-                        ),
                     )
                     await logger.info(
                         "orchestrator.sandbox_created",
@@ -990,8 +995,10 @@ class SwarmOrchestrator:
             "idle_agent": idle_agent, "helping": struggling_agent,
         })
 
-        # Reset agent status so it can run again
+        # Reset agent counters so it doesn't trip budget/stall detection
+        # (archives old token usage to global billing tracker)
         try:
+            await self._state.reset_agent_for_redispatch(idle_agent)
             await self._state.set_agent_status(idle_agent, AgentStatus.IDLE)
         except Exception as exc:
             await logger.warning(
@@ -1112,8 +1119,13 @@ class SwarmOrchestrator:
 
         # Build prompt with workspace context
         workspace_ctx = await self._build_workspace_bootstrap()
+
+        # Cap max_iterations for dynamic tasks to prevent runaway token spend
+        capped_config = agent_config.model_copy(update={
+            "max_iterations": min(agent_config.max_iterations, 15),
+        })
         enhanced_prompt = self._build_enhanced_prompt(
-            agent_config=agent_config,
+            agent_config=capped_config,
             task=task_prompt,
             ltm_context="",
             workspace_context=workspace_ctx,
@@ -1122,7 +1134,7 @@ class SwarmOrchestrator:
 
         try:
             result = await self._run_agent_loop(
-                agent_config=agent_config,
+                agent_config=capped_config,
                 enhanced_prompt=enhanced_prompt,
                 task_id=f"dynamic-{agent_name}-{int(time.time())}",
             )

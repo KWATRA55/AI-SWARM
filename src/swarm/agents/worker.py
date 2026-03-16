@@ -122,6 +122,10 @@ class WorkerAgent:
     # Completion signals the agent can emit
     COMPLETION_SIGNALS = {"[TASK_COMPLETE]", "[DONE]", "[FINISHED]"}
 
+    # Token budget per task — stop if exceeded to prevent runaway spending
+    # Now config-driven via AgentConfig.token_budget; this class default is a fallback
+    TOKEN_BUDGET = 50_000
+
     def __init__(
         self,
         *,
@@ -151,6 +155,16 @@ class WorkerAgent:
         self._tool_count = 0
         self._file_writes = 0
         self._file_reads = 0
+        self._budget_warned = False
+
+        # LLM Gateway for fallback routing and caching
+        try:
+            from swarm.core.llm_gateway import LLMGateway
+            self._gateway = LLMGateway(
+                fallback_models=config.fallback_models,
+            )
+        except Exception:
+            self._gateway = None
 
     @property
     def name(self) -> str:
@@ -243,15 +257,19 @@ class WorkerAgent:
 
     async def _run_loop(self, task: str, task_id: str) -> str:
         """The inner agentic loop."""
-        from litellm import acompletion
+        from litellm import acompletion  # fallback if gateway unavailable
 
-        # Add initial task message
+        # Add initial task message with efficiency instructions
         self._messages.append({
             "role": "user",
             "content": (
                 f"Execute the following task:\n\n{task}\n\n"
-                f"When finished, include '[TASK_COMPLETE]' in your response "
-                f"with a summary of what was accomplished."
+                f"**RULES:**\n"
+                f"- Be efficient. Only read files directly relevant to the task.\n"
+                f"- Do NOT scan the entire codebase. Read only what you need.\n"
+                f"- Plan before acting: think → read key files → make changes → verify.\n"
+                f"- Complete in as few iterations as possible.\n"
+                f"- When finished, include '[TASK_COMPLETE]' with a brief summary.\n"
             ),
         })
 
@@ -262,6 +280,44 @@ class WorkerAgent:
 
         while self._iteration < self._config.max_iterations:
             if self._shutdown.is_set():
+                break
+
+            # --- Token budget check ---
+            budget = self._config.token_budget
+            used = self._total_tokens.total_tokens
+
+            # 90% soft warning — inject finalization prompt
+            if used > budget * 0.9 and not getattr(self, '_budget_warned', False):
+                self._budget_warned = True
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM: Token budget warning — you have used "
+                        f"{used:,} of {budget:,} tokens (90%). "
+                        f"Wrap up your current work and finalize immediately."
+                    ),
+                })
+                await logger.warning(
+                    "worker.token_budget_warning",
+                    agent=self.name,
+                    tokens=used,
+                    budget=budget,
+                )
+
+            # 100% hard stop
+            if used > budget:
+                await logger.warning(
+                    "worker.token_budget_exceeded",
+                    agent=self.name,
+                    tokens=used,
+                    budget=budget,
+                )
+                summary = (
+                    f"[TASK_COMPLETE] Stopped — token budget of "
+                    f"{budget:,} reached "
+                    f"({used:,} used). "
+                    f"Work done so far has been saved."
+                )
                 break
 
             self._iteration += 1
@@ -288,7 +344,19 @@ class WorkerAgent:
                     call_kwargs["tools"] = tools
                     call_kwargs["tool_choice"] = "auto"
 
-                response = await acompletion(**call_kwargs)
+                if self._gateway is not None:
+                    response = await self._gateway.complete(
+                        model=self._config.model,
+                        messages=self._messages,
+                        tools=tools if tools else None,
+                        tool_choice="auto" if tools else None,
+                        temperature=self._config.temperature,
+                        max_tokens=4096,
+                        timeout=self._config.timeout_seconds,
+                        agent_name=self.name,
+                    )
+                else:
+                    response = await acompletion(**call_kwargs)
                 consecutive_errors = 0  # Reset on success
 
                 # --- Broadcast LLM call metrics to dashboard ---
@@ -427,14 +495,30 @@ class WorkerAgent:
                 )
                 break
 
-            # Prompt for continuation
-            self._messages.append({
-                "role": "user",
-                "content": (
-                    "Continue with the task. Use tools as needed. "
-                    "When finished, include '[TASK_COMPLETE]' in your response."
-                ),
-            })
+            # Prompt for continuation with structured self-assessment
+            iteration_pct = self._iteration / self._config.max_iterations
+            if iteration_pct >= 0.8:
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        "SYSTEM: You are approaching the iteration limit "
+                        f"({self._iteration}/{self._config.max_iterations}). "
+                        "Finalize your work immediately. Output your final "
+                        "result and include '[TASK_COMPLETE]' with a summary."
+                    ),
+                })
+            else:
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        "Assess your progress on the task.\n"
+                        "- If the task is COMPLETE and all requirements are met, "
+                        "respond with '[TASK_COMPLETE]' and a brief summary of "
+                        "what was accomplished.\n"
+                        "- If work REMAINS, explain exactly what needs to be "
+                        "done next and proceed with the next step."
+                    ),
+                })
 
         if not summary:
             summary = f"Agent reached iteration limit ({self._config.max_iterations})."

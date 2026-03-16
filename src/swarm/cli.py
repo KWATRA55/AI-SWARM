@@ -181,6 +181,10 @@ def run(
         False, "--interactive", "-i",
         help="Start dashboard and wait for user chat — don't auto-run agents.",
     ),
+    target: Optional[Path] = typer.Option(
+        None, "--target",
+        help="External project directory for agents to operate on (overrides workspace).",
+    ),
 ) -> None:
     """🚀 Run the swarm orchestration engine."""
     from swarm.config.loader import load_config
@@ -190,7 +194,7 @@ def run(
 
     # --- Load config ---
     try:
-        config = load_config(config_path)
+        config = load_config(config_path, workspace_override=target)
     except Exception as exc:
         typer.secho(f"❌ Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)

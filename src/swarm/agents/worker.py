@@ -458,7 +458,7 @@ class WorkerAgent:
                         })
 
                     # Truncate large tool outputs to save tokens
-                    _MAX_TOOL_OUTPUT_CHARS = 8_000  # ~2K tokens
+                    _MAX_TOOL_OUTPUT_CHARS = 4_000  # ~1K tokens (was 8K)
                     if len(tool_result) > _MAX_TOOL_OUTPUT_CHARS:
                         tool_result = (
                             tool_result[:_MAX_TOOL_OUTPUT_CHARS]
@@ -472,6 +472,13 @@ class WorkerAgent:
                         "tool_call_id": tool_call.id,
                         "content": tool_result,
                     })
+
+                # --- Post-write content scrubbing ---
+                # After write_file tool calls, the full file content sits in
+                # the assistant message's tool_call args. This can be 5K+
+                # tokens for a single file write. Scrub it to prevent
+                # re-sending the entire content on every subsequent LLM call.
+                self._scrub_write_file_content()
 
                 # Log to state
                 await self._state.add_message(
@@ -535,6 +542,40 @@ class WorkerAgent:
         return summary
 
     # -------------------------------------------------------------------
+    # Post-write content scrubbing (token economy)
+    # -------------------------------------------------------------------
+
+    def _scrub_write_file_content(self) -> None:
+        """Scrub write_file content from stored assistant messages.
+
+        When the LLM calls write_file(path, content), the full file content
+        (often 3-10K tokens) persists in self._messages as the assistant's
+        tool_call arguments. This content gets re-sent to the LLM on EVERY
+        subsequent call, wasting massive tokens.
+
+        This method replaces the full content with a 200-char preview.
+        """
+        for msg in self._messages:
+            tool_calls = msg.get("tool_calls")
+            if not tool_calls or msg.get("role") != "assistant":
+                continue
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                if fn.get("name") != "write_file":
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                    content = args.get("content", "")
+                    if len(content) > 200:
+                        args["content"] = (
+                            content[:200]
+                            + f"\n... [{len(content):,} chars written]"
+                        )
+                        fn["arguments"] = json.dumps(args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    # -------------------------------------------------------------------
     # Tool call execution
     # -------------------------------------------------------------------
 
@@ -595,7 +636,7 @@ class WorkerAgent:
 
         return json.dumps({
             "success": result.success,
-            "output": (result.output or "")[:8000],
+            "output": (result.output or "")[:4000],  # Match 4K source cap
             "error": result.error or "",
         })
 
@@ -709,15 +750,16 @@ class WorkerAgent:
         total_chars = sum(len(m.get("content") or "") for m in self._messages)
         estimated_tokens = total_chars // 4  # Rough estimate
 
-        # Compress early to prevent token waste — 8K is ~$0.02 on Gemini Pro
-        threshold = 8_000  # ~8K tokens triggers compression (was 16K)
+        # Compress early to prevent token waste — 6K threshold (~$0.015 on Gemini Pro)
+        threshold = 6_000  # ~6K tokens triggers compression (was 8K→16K)
         if estimated_tokens < threshold:
             return
 
-        # Keep system prompt and last 4 messages, compress the middle
+        # Keep system prompt and last 2 messages, compress the middle
+        # (was last 4 — too much context carried forward)
         system_msg = self._messages[0]
-        recent = self._messages[-4:]
-        middle = self._messages[1:-4]
+        recent = self._messages[-2:]
+        middle = self._messages[1:-2]
 
         if len(middle) < 2:
             return  # Not enough to compress

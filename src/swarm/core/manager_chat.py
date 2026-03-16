@@ -102,6 +102,7 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
             "content": self.SYSTEM_PROMPT.format(workspace=workspace),
         }]
         self._message_count = 0
+        self._cached_scan: str | None = None  # Cache codebase scan
 
     def set_dispatch_fn(self, fn: Callable[..., Coroutine]) -> None:
         """Set the function to dispatch tasks to sub-agents."""
@@ -118,18 +119,21 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
         self._message_count += 1
         self._messages.append({"role": "user", "content": user_message})
 
-        # Include codebase context if this is the first message or user asks for scan
-        scan_keywords = {"scan", "look", "analyze", "check", "review", "what", "suggest", "improve", "feature"}
+        # Only scan on first message or explicit scan keywords (not every msg)
+        scan_keywords = {"scan", "rescan", "analyze", "review"}
         should_scan = (
-            self._message_count <= 2
+            self._message_count == 1  # Only first msg, not first 2
             or any(k in user_message.lower() for k in scan_keywords)
         )
 
         if should_scan:
-            codebase_ctx = await self._scan_codebase()
+            if self._cached_scan is None or any(k in user_message.lower() for k in {"rescan"}):
+                await logger.info("manager_chat.scanning_codebase")
+                self._cached_scan = await self._scan_codebase()
+                await logger.info("manager_chat.scan_complete", ctx_length=len(self._cached_scan))
             self._messages.append({
                 "role": "system",
-                "content": f"--- CODEBASE SNAPSHOT ---\n{codebase_ctx}\n--- END SNAPSHOT ---",
+                "content": f"--- CODEBASE SNAPSHOT ---\n{self._cached_scan}\n--- END SNAPSHOT ---",
             })
 
         # Define tools the manager can call
@@ -186,9 +190,9 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
         ]
 
         # Multi-round tool calling loop
-        max_rounds = 5
+        max_rounds = 10
         content = ""
-        for _ in range(max_rounds):
+        for round_num in range(max_rounds):
             try:
                 response = await litellm.acompletion(
                     model=self._model,
@@ -199,11 +203,18 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
                 )
             except Exception as exc:
                 error_msg = f"❌ Manager LLM error: {exc}"
-                await logger.error("manager_chat.llm_failed", error=str(exc))
+                await logger.error("manager_chat.llm_failed", error=str(exc), round=round_num)
                 return error_msg
 
             choice = response.choices[0]
             message = choice.message
+
+            await logger.info(
+                "manager_chat.llm_response",
+                round=round_num,
+                has_tool_calls=bool(message.tool_calls),
+                content_length=len(message.content or ""),
+            )
 
             if message.tool_calls:
                 self._messages.append(message.model_dump())
@@ -217,6 +228,11 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
                         args = {}
 
                     result = await self._execute_tool(fn_name, args)
+                    await logger.info(
+                        "manager_chat.tool_executed",
+                        tool=fn_name,
+                        result_length=len(result),
+                    )
                     self._messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -227,6 +243,24 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
             else:
                 content = message.content or ""
                 break
+
+        # If all rounds were tool calls, force a final text response
+        if not content:
+            await logger.warning(
+                "manager_chat.forcing_text_response",
+                rounds_exhausted=max_rounds,
+            )
+            try:
+                final_response = await litellm.acompletion(
+                    model=self._model,
+                    messages=self._messages,
+                    tool_choice="none",  # Force text, no tools
+                    temperature=0.3,
+                )
+                content = final_response.choices[0].message.content or ""
+            except Exception as exc:
+                content = f"I analyzed the codebase but ran out of processing rounds. Error: {exc}"
+                await logger.error("manager_chat.force_text_failed", error=str(exc))
 
         self._messages.append({"role": "assistant", "content": content})
 
@@ -250,7 +284,7 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
         return f"Unknown tool: {name}"
 
     async def _scan_codebase(self) -> str:
-        """Scan the workspace and return a directory tree."""
+        """Scan the workspace — lightweight file list (no sizes to save tokens)."""
         lines: list[str] = []
         file_count = 0
 
@@ -258,9 +292,11 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
             dirs[:] = [
                 d for d in dirs
                 if d not in {'.git', '.venv', 'node_modules', '__pycache__',
-                             '.swarm_memory', '.next'}
+                             '.swarm_memory', '.next', 'dist', 'build'}
             ]
             level = root.replace(str(self._workspace), '').count(os.sep)
+            if level > 3:  # Max depth 3 to keep scan lean
+                continue
             indent = '  ' * level
             basename = os.path.basename(root) or str(self._workspace)
             lines.append(f"{indent}{basename}/")
@@ -269,19 +305,13 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
             for f in sorted(files):
                 if f.startswith('.'):
                     continue
-                filepath = os.path.join(root, f)
-                try:
-                    size = os.path.getsize(filepath)
-                    lines.append(f"{sub_indent}{f}  ({size:,} bytes)")
-                    file_count += 1
-                except OSError:
-                    lines.append(f"{sub_indent}{f}")
-                    file_count += 1
+                lines.append(f"{sub_indent}{f}")
+                file_count += 1
 
-                if file_count > 150:
+                if file_count > 30:  # Strict cap (was 150 — massive token waste)
+                    lines.append("  ... (truncated at 30 files)")
                     break
-            if file_count > 150:
-                lines.append("  ... (truncated at 150 files)")
+            if file_count > 30:
                 break
 
         return '\n'.join(lines) if lines else '(empty workspace)'

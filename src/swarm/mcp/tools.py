@@ -138,57 +138,61 @@ class ToolDescriptor(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Map of tool name → (descriptor, input_model_class)
+def _minimize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Strip Pydantic bloat from JSON schemas to save ~50% tokens per LLM call.
+
+    Removes $defs, title, default values, and nested title fields that
+    Pydantic's model_json_schema() adds but LLMs don't need.
+    """
+    clean: dict[str, Any] = {}
+    for k, v in schema.items():
+        if k in ("$defs", "title", "default"):
+            continue
+        if k == "properties" and isinstance(v, dict):
+            clean[k] = {
+                pk: {fk: fv for fk, fv in pv.items() if fk not in ("title", "default")}
+                for pk, pv in v.items()
+            }
+        else:
+            clean[k] = v
+    return clean
+
+
 TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
     "read_file": ToolDescriptor(
         name="read_file",
-        description=(
-            "Read the contents of a file from the shared workspace. "
-            "Returns the file content as text. Supports optional line range."
-        ),
-        parameters=ReadFileInput.model_json_schema(),
+        description="Read a file. Use start_line/end_line for large files.",
+        parameters=_minimize_schema(ReadFileInput.model_json_schema()),
     ),
     "write_file": ToolDescriptor(
         name="write_file",
-        description=(
-            "Write or create a file in the shared workspace. The write is "
-            "safely serialised through the event bus to prevent concurrent "
-            "write corruption from parallel agents."
-        ),
-        parameters=WriteFileInput.model_json_schema(),
+        description="Write/create a file (auto-locked for concurrent safety).",
+        parameters=_minimize_schema(WriteFileInput.model_json_schema()),
     ),
     "list_directory": ToolDescriptor(
         name="list_directory",
-        description=(
-            "List the contents of a directory in the workspace. "
-            "Returns file names, sizes, and types."
-        ),
-        parameters=ListDirectoryInput.model_json_schema(),
+        description="List directory contents (max 50 entries).",
+        parameters=_minimize_schema(ListDirectoryInput.model_json_schema()),
     ),
     "run_command": ToolDescriptor(
         name="run_command",
-        description=(
-            "Execute a shell command inside the agent's sandbox container. "
-            "Returns stdout, stderr, and exit code."
-        ),
-        parameters=RunCommandInput.model_json_schema(),
+        description="Run a shell command. Returns stdout and exit code.",
+        parameters=_minimize_schema(RunCommandInput.model_json_schema()),
     ),
     "git_diff": ToolDescriptor(
         name="git_diff",
-        description="Show git diff of changes in the workspace.",
-        parameters=GitDiffInput.model_json_schema(),
+        description="Show git diff of workspace changes.",
+        parameters=_minimize_schema(GitDiffInput.model_json_schema()),
     ),
     "git_commit": ToolDescriptor(
         name="git_commit",
-        description="Stage files and create a git commit in the workspace.",
-        parameters=GitCommitInput.model_json_schema(),
+        description="Stage files and commit.",
+        parameters=_minimize_schema(GitCommitInput.model_json_schema()),
     ),
     "search_memory": ToolDescriptor(
         name="search_memory",
-        description=(
-            "Search the team's long-term memory for relevant knowledge from "
-            "past sessions: bug fixes, architectural patterns, coding conventions."
-        ),
-        parameters=SearchMemoryInput.model_json_schema(),
+        description="Search team's long-term memory for past knowledge.",
+        parameters=_minimize_schema(SearchMemoryInput.model_json_schema()),
     ),
 }
 
@@ -373,6 +377,7 @@ class ToolExecutor:
 
         try:
             content = target.read_text(encoding="utf-8")
+            total_lines = content.count("\n") + 1
 
             # Apply line range if specified
             if params.start_line or params.end_line:
@@ -381,10 +386,16 @@ class ToolExecutor:
                 end = params.end_line or len(lines)
                 content = "".join(lines[start:end])
 
+            # Cap at 4K chars to prevent context bloat (was unbounded)
+            _MAX = 4_000
+            truncated = len(content) > _MAX
+            if truncated:
+                content = content[:_MAX] + f"\n... [TRUNCATED — {len(content):,} chars total, {total_lines} lines. Use start_line/end_line to read specific sections.]"
+
             return ToolResult(
                 success=True,
                 output=content,
-                metadata={"path": str(target), "size": target.stat().st_size},
+                metadata={"path": str(target), "size": target.stat().st_size, "lines": total_lines},
             )
         except UnicodeDecodeError:
             return ToolResult(
@@ -503,8 +514,8 @@ class ToolExecutor:
                         size = item.stat().st_size
                         entries.append(f"{prefix}{rel}  ({size:,} bytes)")
 
-                    if len(entries) > 200:  # Safety cap
-                        entries.append("... (truncated at 200 entries)")
+                    if len(entries) > 50:  # Token-saving cap (was 200)
+                        entries.append("... (truncated at 50 entries)")
                         return
             except PermissionError:
                 entries.append(f"{prefix}[permission denied]")
@@ -565,7 +576,7 @@ class ToolExecutor:
 
             return ToolResult(
                 success=exit_code == 0,
-                output=output[-10_000:],  # Cap output length
+                output=output[-2_000:],  # Cap output (was 10K — major token waste)
                 error="" if exit_code == 0 else f"Exit code: {exit_code}",
                 metadata={"exit_code": exit_code},
             )

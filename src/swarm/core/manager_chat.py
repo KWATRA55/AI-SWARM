@@ -79,7 +79,8 @@ class ManagerChat:
 
 **Current workspace:** {workspace}
 
-Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again."""
+Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again.
+IMPORTANT: When assigning write-heavy tasks, instruct agents to batch-write ALL files in a single response using multiple tool calls, NOT one file at a time."""
 
     def __init__(
         self,
@@ -89,12 +90,14 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
         dispatch_fn: Callable[..., Coroutine] | None = None,
         dashboard_cb: Callable[..., Coroutine] | None = None,
         state: Any | None = None,
+        ledger: Any | None = None,
     ) -> None:
         self._model = model
         self._workspace = workspace
         self._dispatch_fn = dispatch_fn
         self._dashboard_cb = dashboard_cb
         self._state = state  # SwarmState — for agent status lookups
+        self._ledger = ledger  # SessionLedger (optional)
 
         # Conversation history
         self._messages: list[dict[str, str]] = [{
@@ -339,6 +342,15 @@ Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immedi
             agent=agent,
             task=task[:100],
         )
+
+        # --- Session Ledger: record routing decision ---
+        if self._ledger is not None:
+            self._ledger.record_routing_decision(
+                agent="manager",
+                target_agent=agent,
+                task_preview=task[:500],
+                reason="Manager LLM chose this agent via dispatch_task tool call",
+            )
 
         try:
             asyncio.create_task(self._dispatch_fn(agent, task))

@@ -580,6 +580,15 @@ class SwarmConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     rate_limits: RateLimitConfig = Field(default_factory=RateLimitConfig)
 
+    # --- Telemetry ---
+    enable_session_replay: bool = Field(
+        default=False,
+        description=(
+            "When True, records every LLM call, tool execution, memory search, "
+            "and routing decision to a JSONL file for post-run analysis."
+        ),
+    )
+
     # --- Global LLM defaults ---
     default_model: str = Field(
         default="gpt-4o",

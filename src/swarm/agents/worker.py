@@ -63,6 +63,7 @@ from swarm.core.state import (
 from swarm.events.bus import EventBus, SwarmEvent
 from swarm.events.channels import BroadcastChannel
 from swarm.mcp.tools import ToolExecutor
+from swarm.core.telemetry import NoOpLedger
 
 logger = structlog.get_logger(__name__)
 
@@ -135,6 +136,7 @@ class WorkerAgent:
         compressor: Compressor | None = None,
         event_bus: EventBus | None = None,
         dashboard_callback: Any | None = None,
+        ledger: Any | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -142,6 +144,7 @@ class WorkerAgent:
         self._compressor = compressor
         self._event_bus = event_bus
         self._dashboard_callback = dashboard_callback  # async fn(event_type, data)
+        self._ledger = ledger or NoOpLedger()
 
         # Interrupt handling
         self._interrupts = InterruptContext()
@@ -345,6 +348,8 @@ class WorkerAgent:
                     call_kwargs["tools"] = tools
                     call_kwargs["tool_choice"] = "auto"
 
+                _call_start = time.monotonic()
+
                 if self._gateway is not None:
                     response = await self._gateway.complete(
                         model=self._config.model,
@@ -436,6 +441,24 @@ class WorkerAgent:
             choice = response.choices[0]
             message = choice.message
             content = message.content or ""
+
+            # --- Session Ledger: record LLM call ---
+            _tool_names: list[str] = []
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                _tool_names = [tc.function.name for tc in message.tool_calls]
+            self._ledger.record_llm_call(
+                agent=self.name,
+                model=self._config.model,
+                messages=self._messages,
+                response_text=content,
+                tool_calls=_tool_names or None,
+                prompt_tokens=self._last_prompt_tokens,
+                completion_tokens=getattr(response.usage, 'completion_tokens', 0) if response.usage else 0,
+                total_tokens=getattr(response.usage, 'total_tokens', 0) if response.usage else 0,
+                cumulative_tokens=self._total_tokens.total_tokens,
+                iteration=self._iteration,
+                wall_clock_ms=round((time.monotonic() - _call_start) * 1000, 1) if '_call_start' in dir() else 0,
+            )
 
             # Check for tool calls
             if hasattr(message, "tool_calls") and message.tool_calls:
@@ -586,6 +609,8 @@ class WorkerAgent:
             args_preview=str(arguments)[:200],
         )
 
+        _tool_start = time.monotonic()
+
         # Broadcast to dashboard
         if self._dashboard_callback:
             try:
@@ -597,7 +622,18 @@ class WorkerAgent:
                 pass
 
         result = await self._executor.execute(tool_name, arguments)
+        _tool_duration = (time.monotonic() - _tool_start) * 1000
         self._tool_count += 1
+
+        # --- Session Ledger: record tool execution ---
+        self._ledger.record_tool_execution(
+            agent=self.name,
+            tool_name=tool_name,
+            arguments=arguments,
+            result_str=json.dumps({"success": result.success, "output": (result.output or "")[:500]}),
+            success=result.success,
+            duration_ms=round(_tool_duration, 1),
+        )
 
         # Broadcast tool result to dashboard
         if self._dashboard_callback:
@@ -785,6 +821,16 @@ class WorkerAgent:
                 original_tokens=result.original_tokens,
                 compressed_tokens=result.compressed_tokens,
                 ratio=round(result.compression_ratio, 3),
+            )
+
+            # --- Session Ledger: record compression ---
+            self._ledger.record_compression(
+                agent=self.name,
+                original_tokens=result.original_tokens,
+                compressed_tokens=result.compressed_tokens,
+                ratio=round(result.compression_ratio, 3),
+                messages_before=len(middle) + 1 + 2,  # system + middle + recent
+                messages_after=len(self._messages),
             )
 
     # -------------------------------------------------------------------

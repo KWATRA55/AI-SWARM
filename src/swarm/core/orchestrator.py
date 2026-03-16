@@ -86,6 +86,7 @@ from swarm.mcp.tools import ToolExecutor
 from swarm.agents.worker import WorkerAgent
 from swarm.infra.rate_limiter import SwarmRateLimiter
 from swarm.infra.env import inject_sandbox_env, load_env
+from swarm.core.telemetry import SessionLedger, NoOpLedger
 
 logger = structlog.get_logger(__name__)
 
@@ -232,6 +233,17 @@ class SwarmOrchestrator:
         # Track active worker agents for kill switch
         self._active_workers: list[Any] = []  # WorkerAgent instances
         self._active_tasks: list[asyncio.Task] = []  # Running agent tasks
+
+        # Session Replay Ledger (toggleable telemetry)
+        if config.enable_session_replay:
+            self._ledger: SessionLedger | NoOpLedger = SessionLedger(
+                session_id=self._state.session_id,
+                output_dir=config.workspace / ".swarm_logs",
+                enabled=True,
+                verbose=True,
+            )
+        else:
+            self._ledger = NoOpLedger()
 
     @property
     def state(self) -> SwarmState:
@@ -436,6 +448,7 @@ class SwarmOrchestrator:
             raise
         finally:
             # --- Teardown ---
+            self._ledger.close()  # Flush session replay ledger
             await self._teardown()
             self._running = False
 
@@ -816,6 +829,7 @@ class SwarmOrchestrator:
             compressor=self._compressor,
             event_bus=self._event_bus,
             dashboard_callback=dashboard_cb,
+            ledger=self._ledger,
         )
 
         # Track for kill switch

@@ -17,6 +17,9 @@
 name: screener-mvp
 workspace: "${SWARM_WORKSPACE:-/tmp/screener-mvp}"
 
+# --- Session Replay (diagnostic — disable after optimization) ---
+enable_session_replay: true
+
 # --- Global defaults ---
 default_model: "gemini/gemini-2.5-flash"
 

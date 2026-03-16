@@ -156,6 +156,7 @@ class WorkerAgent:
         self._file_writes = 0
         self._file_reads = 0
         self._budget_warned = False
+        self._last_prompt_tokens = 0  # Track ACTUAL API prompt tokens for compression
 
         # LLM Gateway for fallback routing and caching
         try:
@@ -264,11 +265,11 @@ class WorkerAgent:
             "role": "user",
             "content": (
                 f"Execute the following task:\n\n{task}\n\n"
-                f"**RULES:**\n"
-                f"- Be efficient. Only read files directly relevant to the task.\n"
-                f"- Do NOT scan the entire codebase. Read only what you need.\n"
-                f"- Plan before acting: think → read key files → make changes → verify.\n"
-                f"- Complete in as few iterations as possible.\n"
+                f"**EFFICIENCY RULES (critical):**\n"
+                f"- Write ALL files in a SINGLE response using multiple tool calls.\n"
+                f"- Do NOT write one file, respond with text, then write the next.\n"
+                f"- Plan first, then execute all writes at once.\n"
+                f"- Only read files directly relevant to the task.\n"
                 f"- When finished, include '[TASK_COMPLETE]' with a brief summary.\n"
             ),
         })
@@ -418,6 +419,7 @@ class WorkerAgent:
 
             # --- Track token usage ---
             if response.usage:
+                self._last_prompt_tokens = response.usage.prompt_tokens or 0
                 usage = TokenUsage(
                     prompt_tokens=response.usage.prompt_tokens,
                     completion_tokens=response.usage.completion_tokens,
@@ -511,28 +513,16 @@ class WorkerAgent:
                 )
                 break
 
-            # Prompt for continuation with structured self-assessment
+            # Only inject finalization nudge near iteration limit
+            # (removed verbose self-assessment — it caused one-file-at-a-time
+            # behavior, adding 8+ unnecessary iterations and 20K+ wasted tokens)
             iteration_pct = self._iteration / self._config.max_iterations
-            if iteration_pct >= 0.8:
+            if iteration_pct >= 0.75:
                 self._messages.append({
                     "role": "user",
                     "content": (
-                        "SYSTEM: You are approaching the iteration limit "
-                        f"({self._iteration}/{self._config.max_iterations}). "
-                        "Finalize your work immediately. Output your final "
-                        "result and include '[TASK_COMPLETE]' with a summary."
-                    ),
-                })
-            else:
-                self._messages.append({
-                    "role": "user",
-                    "content": (
-                        "Assess your progress on the task.\n"
-                        "- If the task is COMPLETE and all requirements are met, "
-                        "respond with '[TASK_COMPLETE]' and a brief summary of "
-                        "what was accomplished.\n"
-                        "- If work REMAINS, explain exactly what needs to be "
-                        "done next and proceed with the next step."
+                        f"SYSTEM: Iteration {self._iteration}/{self._config.max_iterations}. "
+                        "Finalize now. Include '[TASK_COMPLETE]' with summary."
                     ),
                 })
 
@@ -741,19 +731,25 @@ class WorkerAgent:
     # -------------------------------------------------------------------
 
     async def _maybe_compress_context(self) -> None:
-        """Compress the conversation context if it grows too large."""
+        """Compress the conversation context if it grows too large.
+
+        Uses ACTUAL prompt_tokens from the last LLM API response as the
+        ground truth, not a chars/4 estimate (which was 10x too low and
+        caused compression to never fire).
+        """
         if self._compressor is None:
             return
 
-        # Estimate total tokens in context
-        # Guard against None content (assistant messages with tool_calls have content=None)
-        total_chars = sum(len(m.get("content") or "") for m in self._messages)
-        estimated_tokens = total_chars // 4  # Rough estimate
-
-        # Compress early to prevent token waste — 6K threshold (~$0.015 on Gemini Pro)
-        threshold = 6_000  # ~6K tokens triggers compression (was 8K→16K)
-        if estimated_tokens < threshold:
+        # Use actual prompt tokens from API response — the only reliable source
+        actual_tokens = self._last_prompt_tokens
+        if actual_tokens < 2_500:  # Compress when context exceeds 2.5K real tokens
             return
+
+        await logger.info(
+            "worker.compression_triggered",
+            agent=self.name,
+            actual_prompt_tokens=actual_tokens,
+        )
 
         # Keep system prompt and last 2 messages, compress the middle
         # (was last 4 — too much context carried forward)

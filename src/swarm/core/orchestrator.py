@@ -1130,7 +1130,7 @@ class SwarmOrchestrator:
 
         # Cap max_iterations for dynamic tasks to prevent runaway token spend
         capped_config = agent_config.model_copy(update={
-            "max_iterations": min(agent_config.max_iterations, 15),
+            "max_iterations": min(agent_config.max_iterations, 8),  # Was 15 — too many = token waste
         })
         enhanced_prompt = self._build_enhanced_prompt(
             agent_config=capped_config,

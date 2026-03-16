@@ -456,6 +456,14 @@ class SwarmOrchestrator:
             self._event_bus = EventBus(self._config.event_bus)
             await self._event_bus.connect()
             await logger.info("orchestrator.eventbus_connected")
+
+            # Wire event bus into state for Event Sourcing (Step 9)
+            self._state._event_bus = self._event_bus
+
+            # Wire circuit breaker threshold from config (Step 12)
+            self._state.set_circuit_breaker_threshold(
+                self._config.circuit_breaker.max_round_trips,
+            )
         except Exception as exc:
             await logger.warning(
                 "orchestrator.eventbus_connect_failed",

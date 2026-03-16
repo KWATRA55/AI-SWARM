@@ -217,7 +217,7 @@ def _resolve_template_vars(config: SwarmConfig) -> SwarmConfig:
     - ``{{swarm_name}}``    — name of the swarm from the config
     """
     replacements = {
-        "{{workspace}}": config.workspace,
+        "{{workspace}}": str(config.workspace),
         "{{project_name}}": Path(config.workspace).name,
         "{{swarm_name}}": config.name,
     }

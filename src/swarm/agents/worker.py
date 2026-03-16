@@ -457,6 +457,15 @@ class WorkerAgent:
                             "error": f"Tool execution crashed: {tool_exc}",
                         })
 
+                    # Truncate large tool outputs to save tokens
+                    _MAX_TOOL_OUTPUT_CHARS = 8_000  # ~2K tokens
+                    if len(tool_result) > _MAX_TOOL_OUTPUT_CHARS:
+                        tool_result = (
+                            tool_result[:_MAX_TOOL_OUTPUT_CHARS]
+                            + f"\n\n[OUTPUT TRUNCATED — {len(tool_result):,} chars total, "
+                            f"showing first {_MAX_TOOL_OUTPUT_CHARS:,}]"
+                        )
+
                     # Append tool result
                     self._messages.append({
                         "role": "tool",
@@ -700,8 +709,8 @@ class WorkerAgent:
         total_chars = sum(len(m.get("content") or "") for m in self._messages)
         estimated_tokens = total_chars // 4  # Rough estimate
 
-        # Only compress if over threshold (leave room for the system prompt)
-        threshold = 16_000  # ~16K tokens triggers compression
+        # Compress early to prevent token waste — 8K is ~$0.02 on Gemini Pro
+        threshold = 8_000  # ~8K tokens triggers compression (was 16K)
         if estimated_tokens < threshold:
             return
 

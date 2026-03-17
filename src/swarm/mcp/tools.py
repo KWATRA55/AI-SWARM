@@ -71,6 +71,7 @@ class ReadFileInput(BaseModel):
     path: str = Field(description="Relative path to the file within the workspace.")
     start_line: int | None = Field(default=None, description="Optional 1-based start line.")
     end_line: int | None = Field(default=None, description="Optional 1-based end line.")
+    structure_only: bool = Field(default=False, description="Return only class/function signatures, not full content. Use for understanding code structure.")
 
 
 class WriteFileInput(BaseModel):
@@ -188,6 +189,102 @@ TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
 
 
 # ---------------------------------------------------------------------------
+# Tool phases — only send tools the agent needs per iteration
+# ---------------------------------------------------------------------------
+
+TOOL_PHASES: dict[str, list[str]] = {
+    "planning":  ["list_directory", "read_file", "search_memory"],
+    "execution": ["read_file", "write_file", "run_command"],
+    "all":       list(TOOL_DEFINITIONS.keys()),
+}
+
+
+# ---------------------------------------------------------------------------
+# AST-based code summarizer (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _ast_summarize(file_path: Path, content: str) -> str | None:
+    """Return a compact structural summary of a code file.
+
+    For Python files, uses ``ast.parse`` to extract class names, function
+    signatures, and docstrings. For JS/TS, uses regex.
+    Falls back to ``None`` if parsing fails (caller reads full content).
+    """
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".py":
+        return _ast_summarize_python(content)
+    elif suffix in (".js", ".ts", ".tsx", ".jsx"):
+        return _ast_summarize_js(content)
+    # For other languages, return first 40 lines preview
+    lines = content.splitlines()
+    if len(lines) > 40:
+        return "\n".join(lines[:40]) + f"\n\n... [{len(lines)} lines total — use start_line/end_line for full content]"
+    return None  # File is small, full read is fine
+
+
+def _ast_summarize_python(content: str) -> str | None:
+    """Extract Python signatures via AST."""
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return None
+
+    lines: list[str] = []
+    for node in _ast.iter_child_nodes(tree):
+        if isinstance(node, _ast.ClassDef):
+            bases = ", ".join(_ast.unparse(b) for b in node.bases) if node.bases else ""
+            lines.append(f"class {node.name}({bases}):")
+            doc = _ast.get_docstring(node)
+            if doc:
+                lines.append(f'    """{doc[:100]}"""')
+            for item in node.body:
+                if isinstance(item, _ast.FunctionDef | _ast.AsyncFunctionDef):
+                    sig = _ast.unparse(item.args) if hasattr(_ast, "unparse") else "..."
+                    prefix = "async " if isinstance(item, _ast.AsyncFunctionDef) else ""
+                    lines.append(f"    {prefix}def {item.name}({sig})")
+        elif isinstance(node, _ast.FunctionDef | _ast.AsyncFunctionDef):
+            sig = _ast.unparse(node.args) if hasattr(_ast, "unparse") else "..."
+            prefix = "async " if isinstance(node, _ast.AsyncFunctionDef) else ""
+            lines.append(f"{prefix}def {node.name}({sig})")
+            doc = _ast.get_docstring(node)
+            if doc:
+                lines.append(f'    """{doc[:80]}"""')
+        elif isinstance(node, _ast.Import):
+            for alias in node.names:
+                lines.append(f"import {alias.name}")
+        elif isinstance(node, _ast.ImportFrom):
+            names = ", ".join(a.name for a in node.names[:5])
+            lines.append(f"from {node.module} import {names}")
+
+    return "\n".join(lines) if lines else None
+
+
+def _ast_summarize_js(content: str) -> str | None:
+    """Extract JS/TS structure via regex."""
+    import re
+
+    patterns = [
+        r"^export\s+(default\s+)?(async\s+)?(?:function|class|const|interface|type)\s+\w+.*",
+        r"^(?:async\s+)?function\s+\w+.*",
+        r"^class\s+\w+.*",
+        r"^interface\s+\w+.*",
+        r"^type\s+\w+\s*=.*",
+        r"^import\s+.*from\s+['\"].*['\"]",
+    ]
+    combined = "|".join(f"({p})" for p in patterns)
+    matches = re.findall(combined, content, re.MULTILINE)
+    if not matches:
+        return None
+
+    lines = [next(g for g in m if g) for m in matches]
+    return "\n".join(lines[:30])  # Cap at 30 structural lines
+
+
+# ---------------------------------------------------------------------------
 # Tool executor
 # ---------------------------------------------------------------------------
 
@@ -257,10 +354,20 @@ class ToolExecutor:
             if name in TOOL_DEFINITIONS
         ]
 
-    def get_openai_tools(self) -> list[dict[str, Any]]:
-        """Return tools in OpenAI function-calling format for litellm."""
+    def get_openai_tools(self, phase: str = "all") -> list[dict[str, Any]]:
+        """Return tools in OpenAI function-calling format for litellm.
+
+        Parameters
+        ----------
+        phase
+            Tool phase: 'planning' (iter 1), 'execution' (iter 2+), or 'all'.
+        """
+        phase_tools = TOOL_PHASES.get(phase, TOOL_PHASES["all"])
+        # Intersect with allowed tools for this agent
+        active_tools = [t for t in phase_tools if t in self._allowed and t in TOOL_DEFINITIONS]
         tools = []
-        for desc in self.get_tool_descriptors():
+        for name in active_tools:
+            desc = TOOL_DEFINITIONS[name]
             tools.append({
                 "type": "function",
                 "function": {
@@ -369,6 +476,17 @@ class ToolExecutor:
             content = target.read_text(encoding="utf-8")
             total_lines = content.count("\n") + 1
 
+            # --- AST-based structure summary (Phase 3) ---
+            if params.structure_only:
+                summary = _ast_summarize(target, content)
+                if summary:
+                    return ToolResult(
+                        success=True,
+                        output=summary,
+                        metadata={"path": str(target), "mode": "structure", "lines": total_lines},
+                    )
+                # Fall through to normal read if AST fails
+
             # Apply line range if specified
             if params.start_line or params.end_line:
                 lines = content.splitlines(keepends=True)
@@ -376,11 +494,11 @@ class ToolExecutor:
                 end = params.end_line or len(lines)
                 content = "".join(lines[start:end])
 
-            # Cap at 4K chars to prevent context bloat (was unbounded)
-            _MAX = 4_000
+            # Cap at 2K chars (V2: down from 4K)
+            _MAX = 2_000
             truncated = len(content) > _MAX
             if truncated:
-                content = content[:_MAX] + f"\n... [TRUNCATED — {len(content):,} chars total, {total_lines} lines. Use start_line/end_line to read specific sections.]"
+                content = content[:_MAX] + f"\n... [TRUNCATED — {len(content):,} chars total, {total_lines} lines. Use start_line/end_line or structure_only=true.]"
 
             return ToolResult(
                 success=True,

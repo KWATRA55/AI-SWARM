@@ -277,7 +277,6 @@ class WorkerAgent:
             ),
         })
 
-        tools = self._executor.get_openai_tools()
         summary = ""
         consecutive_errors = 0
         max_consecutive_errors = 3
@@ -329,6 +328,12 @@ class WorkerAgent:
 
             # --- Check for pending interrupts ---
             await self._process_interrupts()
+
+            # --- Dynamic tool phasing (V2) ---
+            # Iteration 1: planning tools (list, read, search_memory)
+            # Iteration 2+: execution tools (read, write, run_command)
+            tool_phase = "planning" if self._iteration == 1 else "execution"
+            tools = self._executor.get_openai_tools(phase=tool_phase)
 
             # --- Call LLM ---
             try:
@@ -434,10 +439,10 @@ class WorkerAgent:
                 )
                 await self._state.update_agent_tokens(self.name, usage)
 
-            # --- Compress context AFTER we have real prompt_tokens ---
+            # --- Sliding window AFTER we have real prompt_tokens ---
             # (Must be here, not top-of-loop, because _last_prompt_tokens
             #  is only set from the response we just received.)
-            await self._maybe_compress_context()
+            await self._apply_sliding_window()
 
             # --- Process response ---
             choice = response.choices[0]
@@ -765,75 +770,105 @@ class WorkerAgent:
         )
 
     # -------------------------------------------------------------------
-    # Context compression
+    # Algorithmic Sliding Window (V2 — zero-cost, no LLM)
     # -------------------------------------------------------------------
 
-    async def _maybe_compress_context(self) -> None:
-        """Compress the conversation context if it grows too large.
+    _WINDOW_KEEP_RECENT_PAIRS = 4     # assistant+tool pairs to keep in full
+    _WINDOW_TRIGGER_TOKENS = 2_500    # start windowing above this
+    _STUB_MAX_CHARS = 50              # max chars for stubbed old messages
 
-        Uses ACTUAL prompt_tokens from the last LLM API response as the
-        ground truth, not a chars/4 estimate (which was 10x too low and
-        caused compression to never fire).
+    async def _apply_sliding_window(self) -> None:
+        """Cap context via pure algorithm — no LLM call needed.
+
+        Strategy:
+          1. Always keep messages[0] (system prompt) + messages[1] (task).
+          2. Keep the last N assistant+tool message pairs in full.
+          3. Replace all older messages with a one-line stub:
+             ``[tool: write_file → ok | 200 chars]``
+          4. Archive full dropped messages to Redis for post-task LTM extraction.
+
+        This runs AFTER every LLM call because `_last_prompt_tokens` is only
+        set from the response we just received.
         """
-        if self._compressor is None:
+        actual = self._last_prompt_tokens
+        if actual < self._WINDOW_TRIGGER_TOKENS:
             return
 
-        # Use actual prompt tokens from API response — the only reliable source
-        actual_tokens = self._last_prompt_tokens
-        if actual_tokens < 2_500:  # Compress when context exceeds 2.5K real tokens
+        # Minimum messages: system + task + at least 1 pair
+        if len(self._messages) <= 4:
             return
+
+        msgs_before = len(self._messages)
+
+        # --- Partition messages ---
+        pinned = self._messages[:2]              # system prompt + task
+        body   = self._messages[2:]              # everything else
+
+        # Keep last N*2 messages (each pair = assistant+tool)
+        keep_count = self._WINDOW_KEEP_RECENT_PAIRS * 2
+        if len(body) <= keep_count:
+            return  # Nothing to drop
+
+        to_drop = body[:-keep_count]
+        to_keep = body[-keep_count:]
+
+        # --- Archive dropped messages to Redis ---
+        if self._compressor and hasattr(self._compressor, '_redis') and self._compressor._redis:
+            try:
+                import json as _json
+                archive_key = f"swarm:window_archive:{self._state.session_id}:{self.name}:{self._iteration}"
+                await self._compressor._redis.set(
+                    archive_key,
+                    _json.dumps(to_drop, default=str),
+                    ex=86400 * 7,  # 7-day TTL
+                )
+            except Exception:
+                pass  # Archival is best-effort
+
+        # --- Stub dropped messages ---
+        stubs: list[dict[str, str]] = []
+        for msg in to_drop:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if role == "assistant" and "tool_calls" in msg:
+                # Stub tool call messages
+                tool_names = []
+                for tc in msg.get("tool_calls", []):
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
+                    if fn:
+                        name = fn.get("name", "?") if isinstance(fn, dict) else getattr(fn, "name", "?")
+                        tool_names.append(name)
+                stubs.append({"role": "assistant", "content": f"[used tools: {','.join(tool_names)}]"})
+            elif role == "tool":
+                # Stub tool results to tiny summaries
+                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
+                stubs.append({"role": "user", "content": f"[tool result: {preview}...]"})
+            else:
+                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
+                stubs.append({"role": role, "content": f"[prev: {preview}...]"})
+
+        # --- Rebuild messages ---
+        self._messages = pinned + stubs + to_keep
 
         await logger.info(
-            "worker.compression_triggered",
+            "worker.sliding_window_applied",
             agent=self.name,
-            actual_prompt_tokens=actual_tokens,
+            actual_prompt_tokens=actual,
+            messages_before=msgs_before,
+            messages_after=len(self._messages),
+            dropped=len(to_drop),
+            stubbed=len(stubs),
         )
 
-        # Keep system prompt and last 2 messages, compress the middle
-        # (was last 4 — too much context carried forward)
-        system_msg = self._messages[0]
-        recent = self._messages[-2:]
-        middle = self._messages[1:-2]
-
-        if len(middle) < 2:
-            return  # Not enough to compress
-
-        result = await self._compressor.compress_conversation(
-            middle,
-            context_hint=f"Agent {self.name} mid-task conversation",
-            session_id=self._state.session_id,
+        # --- Session Ledger ---
+        self._ledger.record_compression(
+            agent=self.name,
+            original_tokens=actual,
+            compressed_tokens=0,  # No LLM used — zero cost
+            ratio=0.0,
+            messages_before=msgs_before,
+            messages_after=len(self._messages),
         )
-
-        if result.compression_ratio < 0.9:
-            self._messages = [
-                system_msg,
-                {
-                    "role": "user",
-                    "content": (
-                        "[CONTEXT COMPRESSED — Previous conversation summarised]\n"
-                        f"{result.summary}"
-                    ),
-                },
-                *recent,
-            ]
-
-            await logger.info(
-                "worker.context_compressed",
-                agent=self.name,
-                original_tokens=result.original_tokens,
-                compressed_tokens=result.compressed_tokens,
-                ratio=round(result.compression_ratio, 3),
-            )
-
-            # --- Session Ledger: record compression ---
-            self._ledger.record_compression(
-                agent=self.name,
-                original_tokens=result.original_tokens,
-                compressed_tokens=result.compressed_tokens,
-                ratio=round(result.compression_ratio, 3),
-                messages_before=len(middle) + 1 + 2,  # system + middle + recent
-                messages_after=len(self._messages),
-            )
 
     # -------------------------------------------------------------------
     # Utilities

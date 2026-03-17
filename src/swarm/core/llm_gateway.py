@@ -230,23 +230,28 @@ class LLMGateway:
     def _build_cache_key(
         self, model: str, messages: list[dict[str, Any]],
     ) -> str:
-        """Build a deterministic cache key from the model + messages.
+        """Build a cache key from model + user intent (not system prompt).
 
-        Uses the system prompt hash + last user message content as the
-        cache fingerprint. This is cheaper than embedding-based similarity
-        but catches identical requests from different agents.
+        V2 improvement: strips volatile system prompt and tool results,
+        hashing only the core user messages. This dramatically increases
+        cache hit rates when different agents ask similar questions, or
+        when the same agent retries after a system prompt timestamp change.
         """
-        system_content = ""
-        user_content = ""
+        import re
+
+        user_parts: list[str] = []
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                system_content = content
-            elif role == "user":
-                user_content = content  # last user message wins
+            content = msg.get("content", "") or ""
+            if role == "user":
+                # Strip timestamps, session IDs, and other volatile tokens
+                clean = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*", "", content)
+                clean = re.sub(r"\b[0-9a-f]{8,}\b", "", clean)  # hex IDs
+                clean = clean.strip()
+                if clean:
+                    user_parts.append(clean)
 
-        raw = f"{model}:{system_content}:{user_content}"
+        raw = f"{model}:{'|'.join(user_parts[-3:])}"  # last 3 user messages
         return hashlib.sha256(raw.encode()).hexdigest()
 
     async def _cache_lookup(self, cache_key: str) -> Any | None:

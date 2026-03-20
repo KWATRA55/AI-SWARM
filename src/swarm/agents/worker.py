@@ -260,7 +260,20 @@ class WorkerAgent:
     # -------------------------------------------------------------------
 
     async def _run_loop(self, task: str, task_id: str) -> str:
-        """The inner agentic loop."""
+        """The inner agentic loop.
+
+        V2 Cache Contract
+        -----------------
+        ``self._messages`` ordering is cache-safe:
+
+        * ``messages[0]`` — system prompt (FROZEN; tagged for native
+          prompt caching by LLMGateway)
+        * ``messages[1]`` — task instruction + rules (FROZEN after boot)
+        * ``messages[2+]`` — volatile conversation (tool calls, results,
+          assistant replies, interrupts)
+
+        Do NOT mutate ``messages[0]`` after construction.
+        """
         from litellm import acompletion  # fallback if gateway unavailable
 
         # Add initial task message with efficiency instructions (V2.1: compressed)
@@ -270,6 +283,7 @@ class WorkerAgent:
                 f"{task}\n\n"
                 f"RULES: Write ALL files in ONE response (parallel tool calls). "
                 f"Plan first, then execute. Read only what's needed. "
+                f"Use search_memory to check for relevant past knowledge before starting. "
                 f"End with '[TASK_COMPLETE]' + summary."
             ),
         })
@@ -277,6 +291,46 @@ class WorkerAgent:
         summary = ""
         consecutive_errors = 0
         max_consecutive_errors = 3
+
+        # V2.4: Auto-inject memory search before iteration 1
+        # Agents kept ignoring search_memory — so we do it programmatically.
+        if self._executor._compressor is not None:
+            try:
+                # Extract a search query from the task (first 100 chars)
+                _mem_query = task[:100].strip()
+                memories = await self._executor._compressor.search_memories(
+                    _mem_query, limit=3,
+                )
+                if memories:
+                    mem_lines = []
+                    for mem in memories:
+                        mem_lines.append(f"- [{mem.category.upper()}] {mem.title}: {mem.content[:200]}")
+                    mem_context = "\n".join(mem_lines)
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            f"MEMORY CONTEXT (from past sessions):\n{mem_context}\n\n"
+                            f"Use this context to avoid re-doing work that's already been done."
+                        ),
+                    })
+                    self._ledger.record_memory_search(
+                        agent=self.name,
+                        query=_mem_query,
+                        results_count=len(memories),
+                        top_similarity=0.0,
+                        cache_hit=False,
+                    )
+                    await logger.info(
+                        "worker.auto_memory_injected",
+                        agent=self.name,
+                        memories_found=len(memories),
+                    )
+            except Exception as exc:
+                await logger.warning(
+                    "worker.auto_memory_failed",
+                    agent=self.name,
+                    error=str(exc),
+                )
 
         while self._iteration < self._config.max_iterations:
             if self._shutdown.is_set():
@@ -442,6 +496,14 @@ class WorkerAgent:
             await self._apply_sliding_window()
 
             # --- Process response ---
+            if not response.choices:
+                await logger.warning(
+                    "worker.empty_choices",
+                    agent=self.name,
+                    iteration=self._iteration,
+                )
+                consecutive_errors += 1
+                continue
             choice = response.choices[0]
             message = choice.message
             content = message.content or ""
@@ -502,7 +564,10 @@ class WorkerAgent:
                     })
 
                 # --- Post-write content scrubbing ---
-                self._scrub_write_file_content()
+                try:
+                    self._scrub_write_file_content()
+                except Exception:
+                    pass  # Non-critical — don't crash the loop
 
                 # --- Auto-complete: skip wasteful text-only TASK_COMPLETE call ---
                 # If the assistant's text already contains TASK_COMPLETE, we're done.
@@ -596,7 +661,9 @@ class WorkerAgent:
             if not tool_calls or msg.get("role") != "assistant":
                 continue
             for tc in tool_calls:
-                fn = tc.get("function", {})
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if not fn or not isinstance(fn, dict):
+                    continue
                 if fn.get("name") != "write_file":
                     continue
                 try:
@@ -608,7 +675,7 @@ class WorkerAgent:
                             + f"\n[{len(content):,}ch written]"
                         )
                         fn["arguments"] = json.dumps(args)
-                except (json.JSONDecodeError, TypeError):
+                except (json.JSONDecodeError, TypeError, AttributeError):
                     pass
 
     # -------------------------------------------------------------------
@@ -648,6 +715,14 @@ class WorkerAgent:
         _tool_duration = (time.monotonic() - _tool_start) * 1000
         self._tool_count += 1
 
+        # V2: Truncate error tracebacks to save tokens (max 300 chars)
+        _error_str = result.error or ""
+        if _error_str and len(_error_str) > 300:
+            # Keep "ExceptionType: " + last meaningful line
+            lines = _error_str.strip().splitlines()
+            last_line = lines[-1].strip() if lines else _error_str[:200]
+            _error_str = last_line[:300]
+
         # --- Session Ledger: record tool execution ---
         self._ledger.record_tool_execution(
             agent=self.name,
@@ -685,8 +760,8 @@ class WorkerAgent:
 
         return json.dumps({
             "success": result.success,
-            "output": (result.output or "")[:4000],  # Match 4K source cap
-            "error": result.error or "",
+            "output": (result.output or "")[:2_000],  # V2: aligned to 2K (was 4K)
+            "error": _error_str,
         })
 
     def force_stop(self) -> None:
@@ -828,26 +903,27 @@ class WorkerAgent:
         to_drop = body[:-keep_count]
         to_keep = body[-keep_count:]
 
-        # --- Archive dropped messages to Redis ---
-        if self._compressor and hasattr(self._compressor, '_redis') and self._compressor._redis:
-            try:
-                import json as _json
-                archive_key = f"swarm:window_archive:{self._state.session_id}:{self.name}:{self._iteration}"
-                await self._compressor._redis.set(
-                    archive_key,
-                    _json.dumps(to_drop, default=str),
-                    ex=86400 * 7,  # 7-day TTL
-                )
-            except Exception:
-                pass  # Archival is best-effort
+        # --- Archive dropped messages to telemetry ledger ---
+        for msg in to_drop:
+            self._ledger.record_dropped_message(
+                agent=self.name,
+                role=msg.get("role", "unknown"),
+                content=msg.get("content", "")[:500],
+                iteration=self._iteration,
+            )
 
-        # --- Stub dropped messages ---
+        # --- Stub dropped messages (V2.4: merge assistant+tool pairs) ---
+        # Gemini SDK validates that every `tool` role message has a
+        # matching `tool_calls` entry in a preceding `assistant` message.
+        # We must merge tool results INTO the assistant stub to avoid
+        # orphaned tool messages.
         stubs: list[dict[str, str]] = []
         for msg in to_drop:
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            content = msg.get("content", "") or ""
+
             if role == "assistant" and "tool_calls" in msg:
-                # Stub tool call messages
+                # Start an assistant stub that will absorb following tool results
                 tool_names = []
                 for tc in msg.get("tool_calls", []):
                     fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
@@ -855,13 +931,36 @@ class WorkerAgent:
                         name = fn.get("name", "?") if isinstance(fn, dict) else getattr(fn, "name", "?")
                         tool_names.append(name)
                 stubs.append({"role": "assistant", "content": f"[used tools: {','.join(tool_names)}]"})
+
             elif role == "tool":
-                # Stub tool results to tiny summaries
+                # MERGE into the last assistant stub (never create standalone tool msgs)
                 preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                stubs.append({"role": "user", "content": f"[tool result: {preview}...]"})
+                if stubs and stubs[-1]["role"] == "assistant":
+                    # Append result to existing assistant stub
+                    stubs[-1]["content"] += f" → {preview}"
+                else:
+                    # Orphan tool msg with no preceding assistant — convert to user context
+                    stubs.append({"role": "user", "content": f"[prior tool result: {preview}]"})
+
+            elif role == "assistant":
+                # Plain text assistant msg — merge with prev assistant if consecutive
+                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
+                if stubs and stubs[-1]["role"] == "assistant":
+                    stubs[-1]["content"] += f" | {preview}"
+                else:
+                    stubs.append({"role": "assistant", "content": f"[prev: {preview}]"})
+
+            elif role == "user":
+                # User msgs — merge consecutive
+                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
+                if stubs and stubs[-1]["role"] == "user":
+                    stubs[-1]["content"] += f" | {preview}"
+                else:
+                    stubs.append({"role": role, "content": f"[prev: {preview}]"})
+
             else:
                 preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                stubs.append({"role": role, "content": f"[prev: {preview}...]"})
+                stubs.append({"role": role, "content": f"[prev: {preview}]"})
 
         # --- Rebuild messages ---
         self._messages = pinned + stubs + to_keep

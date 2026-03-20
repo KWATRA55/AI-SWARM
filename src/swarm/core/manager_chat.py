@@ -57,31 +57,37 @@ class ManagerChat:
         response = await chat.send_message("What needs improvement?")
     """
 
-    SYSTEM_PROMPT = """You are the **Manager / Architect** of an AI engineering team. You are the user's primary contact on the dashboard.
+    SYSTEM_PROMPT = """You are the **Manager / Architect** of an AI engineering team.
 
-**Your capabilities:**
-1. **Codebase Analysis**: Scan and read any file in the workspace.
-2. **Task Assignment**: Assign tasks to sub-agents (backend-dev, frontend-dev, db-engineer, qa-engineer, architect) by calling dispatch_task.
-3. **Status Monitoring**: Check agent status with get_agent_status() and proactively report updates.
-4. **Suggestions**: Proactively suggest features, optimizations, bug fixes.
+## INTENT CLASSIFICATION — MANDATORY
+Before responding, classify the user's message into ONE of these categories:
 
-**Communication rules:**
-- Be concise, direct, and action-oriented
-- When assigning work to multiple agents, dispatch ALL of them in a single response
-- After dispatching, confirm which agents got what tasks
-- When the user asks for status, call get_agent_status() first
-- Proactively report when agents complete or fail
+### STATUS (query / report / explanation)
+Trigger: user asks "what's happening", "status", "update", "how's it going", "what did X do", "show me", or any question.
+Allowed tools: get_agent_status(), read_file()
+FORBIDDEN: dispatch_task() — NEVER dispatch on a status query.
+Response: conversational text with data from tools.
 
-**Available tools:**
-- read_file(path) — read a workspace file
-- dispatch_task(agent, task_description) — assign work to a sub-agent  
-- get_agent_status() — check all agents' current status
+### ACTION (explicit build / fix / create command)
+Trigger: user says "build", "create", "fix", "implement", "deploy", "run", "start", "add", "remove", "refactor" + a specific target.
+Allowed tools: dispatch_task(), read_file()
+Response: confirm which agents got which tasks.
 
-**Current workspace:** {workspace}
+### AMBIGUOUS (greeting, vague, unclear)
+Trigger: "hello", "hey", "go ahead", "yes", "ok", or anything without a clear action target.
+Allowed tools: get_agent_status() (optional)
+FORBIDDEN: dispatch_task()
+Response: ask what they'd like to work on, or summarize current state.
 
-Always be proactive. If the user says 'go ahead' or 'yes', dispatch tasks immediately without asking again.
-IMPORTANT: When assigning write-heavy tasks, instruct agents to batch-write ALL files in a single response using multiple tool calls, NOT one file at a time.
-CRITICAL: If the user's message is vague, a greeting, or doesn't describe a specific task (e.g. 'hello', 'hi', 'hey'), do NOT dispatch any agents. Instead, respond conversationally and ask what they'd like to work on. Only dispatch agents when the user has clearly described a task or feature to build."""
+## RULES
+1. You MUST classify intent BEFORE choosing tools.
+2. NEVER dispatch agents unless classification is ACTION with an explicit target.
+3. After agents complete, WAIT for human "go" / "next" before dispatching more.
+4. When dispatching, batch ALL agents in one response.
+5. Be concise — no walls of text.
+
+Workspace: {workspace}"""
+
 
     def __init__(
         self,
@@ -107,6 +113,7 @@ CRITICAL: If the user's message is vague, a greeting, or doesn't describe a spec
         }]
         self._message_count = 0
         self._cached_scan: str | None = None  # Cache codebase scan
+        self._dispatch_blocked = False  # V2.3: Hard dispatch guard flag
 
     def set_dispatch_fn(self, fn: Callable[..., Coroutine]) -> None:
         """Set the function to dispatch tasks to sub-agents."""
@@ -163,7 +170,16 @@ CRITICAL: If the user's message is vague, a greeting, or doesn't describe a spec
                 "type": "function",
                 "function": {
                     "name": "dispatch_task",
-                    "description": "Assign a task to a sub-agent. Available agents: architect, backend-dev, frontend-dev, db-engineer, qa-engineer",
+                    "description": (
+                        "Assign a task to a sub-agent. ONLY use when user explicitly requests building/creating/fixing. "
+                        "NEVER for status queries. Agent roles: "
+                        "architect (docs, architecture, project structure, HEALTH_CHECK, README), "
+                        "backend-dev (backend code, APIs, services), "
+                        "frontend-dev (UI, frontend code, CSS), "
+                        "db-engineer (database, schemas, migrations), "
+                        "qa-engineer (tests, testing, quality). "
+                        "For documentation/file-structure tasks, always use architect."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -193,8 +209,46 @@ CRITICAL: If the user's message is vague, a greeting, or doesn't describe a spec
             },
         ]
 
+        # V2.3: HARD DISPATCH GUARD — programmatic intent classification.
+        # If the message looks like a status query or greeting, physically
+        # remove dispatch_task from tools. The LLM cannot hallucinate a
+        # tool call if the tool doesn't exist in the API payload.
+        _lower = user_message.lower().strip()
+        _STATUS_PATTERNS = {
+            "status", "update", "done", "progress", "how", "what",
+            "show", "check", "report", "?",
+        }
+        _GREET_PATTERNS = {"hello", "hi", "hey", "yo", "sup", "ok", "yes", "no", "thanks"}
+        _ACTION_VERBS = {
+            "build", "create", "fix", "implement", "deploy", "run",
+            "start", "add", "remove", "refactor", "write", "make",
+            "generate", "setup", "install", "configure", "test",
+        }
+        _is_action = any(verb in _lower for verb in _ACTION_VERBS)
+        _is_status = any(pat in _lower for pat in _STATUS_PATTERNS)
+        _is_greet = any(_lower.startswith(g) for g in _GREET_PATTERNS)
+
+        # V2.5: Action verbs ALWAYS take priority.
+        # Previously, "create a FastAPI app returning {\"status\":\"ok\"}" was
+        # blocked because "status" matched _STATUS_PATTERNS even though
+        # "create" matched _ACTION_VERBS.
+        if _is_action:
+            # Has an action verb → allow dispatch, period.
+            self._dispatch_blocked = False
+        elif _is_status or _is_greet or not _is_action:
+            # No action verbs AND looks like a question/greeting → block
+            tools = [t for t in tools if t["function"]["name"] != "dispatch_task"]
+            self._dispatch_blocked = True
+            await logger.info(
+                "manager_chat.dispatch_guard_active",
+                message_preview=_lower[:80],
+                reason="non-action intent detected",
+            )
+        else:
+            self._dispatch_blocked = False
+
         # Multi-round tool calling loop
-        max_rounds = 10
+        max_rounds = 5  # V2: was 10 — manager shouldn't need more than 5
         content = ""
         for round_num in range(max_rounds):
             try:
@@ -279,10 +333,15 @@ CRITICAL: If the user's message is vague, a greeting, or doesn't describe a spec
         if name == "read_file":
             return await self._read_file(args.get("path", ""))
         elif name == "dispatch_task":
-            return await self._dispatch_task(
-                args.get("agent", ""),
-                args.get("task_description", ""),
-            )
+            # V2.3: Hard dispatch guard — reject if guard was active
+            if self._dispatch_blocked:
+                return "❌ Dispatch blocked — this was a status/greeting query, not an action command. Reply with text instead."
+            agent = args.get("agent", "")
+            # V2.3: Validate agent name
+            valid_agents = {"architect", "backend-dev", "frontend-dev", "db-engineer", "qa-engineer"}
+            if agent not in valid_agents:
+                return f"❌ Unknown agent '{agent}'. Valid agents: {', '.join(sorted(valid_agents))}"
+            return await self._dispatch_task(agent, args.get("task_description", ""))
         elif name == "get_agent_status":
             return await self._get_agent_status()
         return f"Unknown tool: {name}"
@@ -327,8 +386,8 @@ CRITICAL: If the user's message is vague, a greeting, or doesn't describe a spec
             if not full_path.exists():
                 return f"File not found: {path}"
             content = full_path.read_text(encoding="utf-8", errors="replace")
-            if len(content) > 8000:
-                content = content[:8000] + "\n... (truncated)"
+            if len(content) > 4000:  # V2: was 8K — manager doesn't need full files
+                content = content[:4000] + "\n... (truncated at 4K chars)"
             return content
         except Exception as exc:
             return f"Error reading {path}: {exc}"

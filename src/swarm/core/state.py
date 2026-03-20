@@ -289,7 +289,13 @@ class SwarmState:
         return record
 
     async def set_agent_status(self, name: str, status: AgentStatus) -> AgentRecord:
-        """Transition an agent's status, enforcing valid transitions."""
+        """Transition an agent's status, enforcing valid transitions.
+
+        V2: Late interrupts on terminal states (COMPLETED/FAILED) are
+        silently absorbed instead of raising InvalidTransitionError.
+        This prevents a deadlock when a schema-change interrupt fires
+        right as an agent finishes.
+        """
         async with self._get_agent_lock(name):  # per-agent lock
             record = self._agents.get(name)
             if record is None:
@@ -297,6 +303,18 @@ class SwarmState:
 
             current = record.status
             if status not in _VALID_AGENT_TRANSITIONS[current]:
+                # V2: Absorb late interrupts on terminal states gracefully
+                if (
+                    status == AgentStatus.INTERRUPTED
+                    and current in {AgentStatus.COMPLETED, AgentStatus.FAILED}
+                ):
+                    await logger.warning(
+                        "state.late_interrupt_absorbed",
+                        agent=name,
+                        current_status=current.value,
+                        requested_status=status.value,
+                    )
+                    return record
                 raise InvalidTransitionError(
                     f"Agent '{name}': cannot transition {current.value} → {status.value}. "
                     f"Allowed: {[s.value for s in _VALID_AGENT_TRANSITIONS[current]]}"

@@ -1070,6 +1070,58 @@ class SwarmOrchestrator:
             await logger.info("orchestrator.agent_resumed", agent=name)
             await self._broadcast("agent_resumed", {"agent": name})
 
+    async def pause_all_agents(self, reason: str = "Dashboard pause-all") -> None:
+        """Pause ALL agents and force-stop running workers.
+
+        V2.3: This is the real "Pause All" — it force-stops workers
+        mid-iteration so they actually halt, not just at boundaries.
+        Also flushes the session ledger to preserve telemetry.
+        """
+        # Force-stop all active workers immediately
+        for worker in self._active_workers:
+            try:
+                worker.force_stop()
+            except Exception:
+                pass
+
+        # Set pause events for all known agents
+        for agent_config in self._config.agents:
+            if agent_config.name not in self._paused_agents:
+                self._paused_agents[agent_config.name] = asyncio.Event()
+
+        # Flush telemetry ledger so logs are preserved
+        if hasattr(self, '_ledger') and self._ledger is not None:
+            try:
+                self._ledger.close()
+            except Exception:
+                pass
+
+        await logger.info(
+            "orchestrator.all_agents_paused",
+            reason=reason,
+            agent_count=len(self._paused_agents),
+        )
+        await self._broadcast("all_agents_paused", {
+            "reason": reason,
+            "agents": list(self._paused_agents.keys()),
+        })
+
+    async def resume_all_agents(self) -> None:
+        """Resume ALL paused agents."""
+        resumed = list(self._paused_agents.keys())
+        for name in resumed:
+            event = self._paused_agents.pop(name, None)
+            if event is not None:
+                event.set()
+
+        await logger.info(
+            "orchestrator.all_agents_resumed",
+            agent_count=len(resumed),
+        )
+        await self._broadcast("all_agents_resumed", {
+            "agents": resumed,
+        })
+
     async def dispatch_dynamic_task(self, agent_name: str, task_prompt: str) -> None:
         """Dispatch a task to a sub-agent on-demand (from Manager Chat).
 

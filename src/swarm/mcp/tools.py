@@ -193,8 +193,8 @@ TOOL_DEFINITIONS: dict[str, ToolDescriptor] = {
 # ---------------------------------------------------------------------------
 
 TOOL_PHASES: dict[str, list[str]] = {
-    "planning":  ["list_directory", "read_file", "search_memory"],
-    "execution": ["read_file", "write_file", "run_command"],
+    "planning":  ["list_directory", "read_file", "search_memory", "write_file"],
+    "execution": ["read_file", "write_file", "run_command", "search_memory"],
     "all":       list(TOOL_DEFINITIONS.keys()),
 }
 
@@ -590,7 +590,11 @@ class ToolExecutor:
             return ToolResult(success=False, error=f"Write failed: {exc}")
 
     async def _exec_list_directory(self, args: dict[str, Any]) -> ToolResult:
-        """List directory contents."""
+        """List directory contents.
+
+        V2: Strips metadata (byte sizes, inodes) — returns only [DIR]/[FILE]
+        prefixed relative paths.  Saves ~40% tokens per listing.
+        """
         params = ListDirectoryInput.model_validate(args)
         target = self._resolve_path(params.path)
 
@@ -615,14 +619,13 @@ class ToolExecutor:
 
                     rel = item.resolve().relative_to(self._workspace)
                     if item.is_dir():
-                        entries.append(f"{prefix}{rel}/")
+                        entries.append(f"[DIR] {rel}")
                         if params.recursive:
                             _walk(item, depth + 1, prefix)
                     else:
-                        size = item.stat().st_size
-                        entries.append(f"{prefix}{rel}  ({size:,} bytes)")
+                        entries.append(f"[FILE] {rel}")
 
-                    if len(entries) > 50:  # Token-saving cap (was 200)
+                    if len(entries) > 50:  # Token-saving cap
                         entries.append("... (truncated at 50 entries)")
                         return
             except PermissionError:

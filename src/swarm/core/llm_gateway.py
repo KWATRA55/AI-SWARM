@@ -158,6 +158,30 @@ class LLMGateway:
                         call_kwargs["max_tokens"] = max_tokens
                     call_kwargs.update(kwargs)
 
+                    # ---- V2: Native API Prompt Caching ----
+                    # Inject provider-specific caching directives to get
+                    # 75-90% cache hit rates on frozen system prompts.
+                    _model_lower = try_model.lower()
+                    if "anthropic" in _model_lower or "claude" in _model_lower:
+                        # Anthropic: add cache_control breakpoint to system msg
+                        call_kwargs.setdefault("extra_headers", {})
+                        call_kwargs["extra_headers"]["anthropic-beta"] = (
+                            "prompt-caching-2024-07-31"
+                        )
+                        # Mark the last system message as cache breakpoint
+                        _msgs = call_kwargs.get("messages", [])
+                        for _msg in _msgs:
+                            if _msg.get("role") == "system":
+                                if isinstance(_msg.get("content"), str):
+                                    _msg["content"] = [
+                                        {
+                                            "type": "text",
+                                            "text": _msg["content"],
+                                            "cache_control": {"type": "ephemeral"},
+                                        }
+                                    ]
+                                break  # Only tag the first system message
+
                     response = await acompletion(**call_kwargs)
 
                     # Log which model actually served the request

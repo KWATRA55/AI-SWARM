@@ -548,7 +548,13 @@ function handleEvent(event) {
       a.lastActivity = `Iter ${a.iter}`;
     }
     if (type === 'tool_executed') { a.tools = data.tools || (a.tools + 1); }
-    if (type === 'tool_call') { a.lastActivity = `🔧 ${data.tool || ''}`.substring(0, 30); }
+    if (type === 'tool_call') {
+      a.lastActivity = `🔧 ${data.tool || ''}`.substring(0, 30);
+      // V2.4: Count file writes from tool calls
+      if (data.tool === 'write_file') a.filesW = (a.filesW || 0) + 1;
+      if (data.tool === 'read_file') a.filesR = (a.filesR || 0) + 1;
+    }
+    if (type === 'file_write') { a.filesW = (a.filesW || 0) + 1; }
   }
 
   // Helper
@@ -852,12 +858,22 @@ function togglePauseAll() {
   if (allPaused) {
     btn.textContent = '▶ Resume All';
     btn.style.background = 'linear-gradient(135deg, var(--accent-green), #059669)';
-    Object.keys(agents).forEach(name => { if (agents[name].status === 'running') pauseAgent(name); });
-    addEvt('system', '⏸ All agents paused');
+    // V2.3: Single WS command — force-stops workers + flushes telemetry
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'pause_all' }));
+    }
+    Object.keys(agents).forEach(name => { agents[name].status = 'paused'; agents[name].lastActivity = 'Paused'; });
+    renderAgents(); renderAgentStatus();
+    addEvt('system', '⏸ All agents paused — session logs saved');
+    addChat('system-msg', '⏸ All agents paused — session logs saved');
   } else {
     btn.textContent = '⏸ Pause All';
     btn.style.background = '';
-    Object.keys(agents).forEach(name => { if (agents[name].status === 'paused') resumeAgent(name); });
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ action: 'resume_all' }));
+    }
+    Object.keys(agents).forEach(name => { if (agents[name].status === 'paused') { agents[name].status = 'running'; agents[name].lastActivity = 'Resumed'; } });
+    renderAgents(); renderAgentStatus();
     addEvt('system', '▶ All agents resumed');
   }
 }

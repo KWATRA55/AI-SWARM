@@ -275,7 +275,7 @@ class MemoryConfig(BaseModel):
         description="Vector store backend: 'lancedb' (local, zero-config).",
     )
     embedding_model: str = Field(
-        default="gemini/text-embedding-004",
+        default="gemini/text-embedding-005",
         description=(
             "litellm-compatible embedding model for vectorising memories. "
             "Used for similarity search during retrieval."

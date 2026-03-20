@@ -279,6 +279,20 @@ class SwarmDashboard:
             if self._orchestrator and agent:
                 await self._orchestrator.resume_agent(agent)
 
+        elif action == "pause_all":
+            # V2.3: Pause ALL agents — force-stop workers + flush telemetry
+            if self._orchestrator:
+                await self._orchestrator.pause_all_agents("Dashboard pause-all")
+                await self.broadcast_event("system", "all_agents_paused",
+                    {"message": "⏸ All agents paused — session logs saved"})
+
+        elif action == "resume_all":
+            # V2.3: Resume ALL paused agents
+            if self._orchestrator:
+                await self._orchestrator.resume_all_agents()
+                await self.broadcast_event("system", "all_agents_resumed",
+                    {"message": "▶ All agents resumed"})
+
         elif action == "update_config":
             await self._handle_config_update(cmd)
 

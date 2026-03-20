@@ -53,10 +53,17 @@ import asyncio
 import json
 import time
 import uuid
+from functools import wraps
 from typing import Any, Callable, Coroutine
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from swarm.config.models import EventBusConfig
 
@@ -123,6 +130,11 @@ class FileWriteLock:
             if acquired:
                 # Safe to write to the file
                 ...
+
+    V2: Includes a background **heartbeat** that extends the lock TTL
+    every ``timeout_ms // 3`` ms, preventing expiry during long LLM
+    generation calls (>30s).  The heartbeat is automatically started on
+    ``acquire()`` and cancelled on ``release()``.
     """
 
     def __init__(
@@ -144,6 +156,7 @@ class FileWriteLock:
         self._retry_interval = retry_interval
         self._max_retries = max_retries
         self._acquired = False
+        self._heartbeat_task: asyncio.Task[None] | None = None
 
     async def acquire(self) -> bool:
         """Attempt to acquire the write lock, retrying up to max_retries.
@@ -166,6 +179,11 @@ class FileWriteLock:
             )
             if result:
                 self._acquired = True
+                # V2: Start heartbeat to keep TTL alive during long operations
+                self._heartbeat_task = asyncio.create_task(
+                    self._heartbeat_loop(),
+                    name=f"lock-heartbeat-{self._file_path}",
+                )
                 await logger.info(
                     "filelock.acquired",
                     file=self._file_path,
@@ -184,7 +202,14 @@ class FileWriteLock:
         return False
 
     async def release(self) -> bool:
-        """Release the lock (only if we are the owner)."""
+        """Release the lock (only if we are the owner).
+
+        V2: Cancels the heartbeat task before releasing to prevent
+        orphaned background tasks.
+        """
+        # V2: Stop heartbeat first
+        await self._stop_heartbeat()
+
         if not self._acquired:
             return False
 
@@ -223,6 +248,46 @@ class FileWriteLock:
             return bool(result)
         except Exception:
             return False
+
+    # ---- V2: Lock heartbeat -------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        """Background task that extends the lock TTL at 1/3 of timeout.
+
+        This ensures the lock never expires while the owning agent is
+        still actively working (e.g. waiting on a 60s LLM generation).
+        """
+        interval = self._timeout_ms / 3_000  # Convert ms → seconds, renew at 1/3
+        try:
+            while self._acquired:
+                await asyncio.sleep(interval)
+                if not self._acquired:
+                    break
+                ok = await self.extend(additional_ms=self._timeout_ms)
+                if ok:
+                    await logger.debug(
+                        "filelock.heartbeat_extended",
+                        file=self._file_path,
+                        ttl_ms=self._timeout_ms,
+                    )
+                else:
+                    await logger.warning(
+                        "filelock.heartbeat_lost",
+                        file=self._file_path,
+                    )
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _stop_heartbeat(self) -> None:
+        """Cancel the heartbeat task if running."""
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
 
     async def __aenter__(self) -> bool:
         return await self.acquire()
@@ -418,6 +483,7 @@ class EventBus:
         """Publish an event to a Redis Stream.
 
         Returns the stream entry ID, or None on failure.
+        V2: Retries up to 3× with exponential backoff on transient Redis errors.
         """
         if not self._redis:
             await logger.warning("eventbus.publish_no_connection", channel=channel)
@@ -433,11 +499,7 @@ class EventBus:
         }
 
         try:
-            entry_id = await self._redis.xadd(
-                stream_key,
-                event_data,
-                maxlen=self._config.max_stream_length,
-            )
+            entry_id = await self._publish_with_retry(stream_key, event_data)
 
             await logger.info(
                 "eventbus.published",
@@ -454,6 +516,22 @@ class EventBus:
                 error=str(exc),
             )
             return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, max=2),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        reraise=True,
+    )
+    async def _publish_with_retry(
+        self, stream_key: str, event_data: dict[str, Any],
+    ) -> str:
+        """Redis XADD with tenacity retry wrapper."""
+        return await self._redis.xadd(
+            stream_key,
+            event_data,
+            maxlen=self._config.max_stream_length,
+        )
 
     async def subscribe(
         self,
@@ -582,6 +660,7 @@ class EventBus:
 
         Returns the number of receivers that got the message.
         Fire-and-forget — no durability guarantees.
+        V2: Retries up to 3× with exponential backoff on transient Redis errors.
         """
         if not self._redis:
             return 0
@@ -590,7 +669,7 @@ class EventBus:
         event_json = event.model_dump_json()
 
         try:
-            receivers = await self._redis.publish(pubsub_channel, event_json)
+            receivers = await self._broadcast_with_retry(pubsub_channel, event_json)
             await logger.info(
                 "eventbus.broadcast",
                 channel=channel,
@@ -605,6 +684,18 @@ class EventBus:
                 error=str(exc),
             )
             return 0
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, max=2),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        reraise=True,
+    )
+    async def _broadcast_with_retry(
+        self, pubsub_channel: str, event_json: str,
+    ) -> int:
+        """Redis PUBLISH with tenacity retry wrapper."""
+        return await self._redis.publish(pubsub_channel, event_json)
 
     async def listen(self, channel: str, handler: EventHandler) -> None:
         """Subscribe to real-time broadcasts on a pub/sub channel."""
@@ -750,16 +841,30 @@ class EventBus:
     # Utility
     # -------------------------------------------------------------------
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, max=2),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        reraise=True,
+    )
     async def stream_length(self, channel: str) -> int:
-        """Get the number of entries in a stream."""
+        """Get the number of entries in a stream.  V2: tenacity retry."""
         if not self._redis:
             return 0
         try:
             return await self._redis.xlen(self._stream_key(channel))
+        except (ConnectionError, TimeoutError, OSError):
+            raise  # Let tenacity handle these
         except Exception:
             return 0
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, max=2),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, OSError)),
+        reraise=True,
+    )
     async def flush_stream(self, channel: str) -> None:
-        """Delete all entries in a stream (for testing)."""
+        """Delete all entries in a stream (for testing).  V2: tenacity retry."""
         if self._redis:
             await self._redis.delete(self._stream_key(channel))

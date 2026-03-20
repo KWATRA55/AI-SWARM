@@ -135,6 +135,19 @@ class SessionSummaryEvent(LedgerEvent):
     duration_seconds: float = 0.0
 
 
+class DroppedMessageEvent(LedgerEvent):
+    """V2: Records a message dropped by the sliding window.
+
+    Archived here so the compressor can extract LTM knowledge from
+    messages that have been evicted from the active context.
+    """
+    event_type: str = "dropped_message"
+    role: str = ""
+    content_preview: str = ""
+    content_chars: int = 0
+    iteration_dropped: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Session Ledger
 # ---------------------------------------------------------------------------
@@ -143,10 +156,12 @@ class SessionSummaryEvent(LedgerEvent):
 class SessionLedger:
     """Append-only JSONL ledger for session replay.
 
-    Each method appends a structured event to the output file.
-    All methods are sync (file I/O is negligible) and thread-safe
-    via single-writer design (only one orchestrator writes).
+    V2.3 FIX: Uses a **sync file handle** opened in ``__init__`` (which runs
+    outside an event loop) so telemetry works immediately.  A background
+    async consumer can optionally be started later via ``start_async()``.
     """
+
+    _SENTINEL = object()  # Drain signal for graceful shutdown
 
     def __init__(
         self,
@@ -173,8 +188,10 @@ class SessionLedger:
         self._compressions = 0
         self._agents: set[str] = set()
 
-        # Output file
+        # V2.3 FIX: Use sync file handle (works from sync __init__)
         self._file_handle = None
+        self._output_path: Path | None = None
+
         if enabled:
             output_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -199,7 +216,7 @@ class SessionLedger:
         return self._output_path if self._enabled else None
 
     def _write(self, event: LedgerEvent) -> None:
-        """Write a single event to the JSONL file."""
+        """Write a single event synchronously to the JSONL file."""
         if not self._enabled or self._file_handle is None:
             return
         try:
@@ -388,7 +405,7 @@ class SessionLedger:
     # -------------------------------------------------------------------
 
     def close(self) -> None:
-        """Write final session summary and close the file."""
+        """Write final session summary and close the file handle."""
         if not self._enabled:
             return
 
@@ -408,18 +425,47 @@ class SessionLedger:
             duration_seconds=round(elapsed, 2),
         ))
 
+        # Close the file handle — all events are already flushed
         if self._file_handle is not None:
             try:
                 self._file_handle.close()
             except Exception:
                 pass
 
-        logger.info(
-            "telemetry.ledger_closed",
-            path=str(self._output_path) if hasattr(self, '_output_path') else "n/a",
-            total_events=self._llm_calls + self._tool_calls + self._memory_searches,
-            total_tokens=self._total_tokens,
+        # Use stdlib logging (not async structlog) since close() is sync
+        import logging
+        logging.getLogger(__name__).info(
+            "telemetry.ledger_closed path=%s events=%d tokens=%d",
+            str(self._output_path) if self._output_path else "n/a",
+            self._llm_calls + self._tool_calls + self._memory_searches,
+            self._total_tokens,
         )
+
+    # -------------------------------------------------------------------
+    # V2: Dropped message archival
+    # -------------------------------------------------------------------
+
+    def record_dropped_message(
+        self,
+        *,
+        agent: str,
+        role: str,
+        content: str,
+        iteration: int = 0,
+    ) -> None:
+        """Archive a message dropped by the sliding window.
+
+        Preserves context for future LTM extraction even after the
+        message is evicted from the active conversation.
+        """
+        self._write(DroppedMessageEvent(
+            session_id=self._session_id,
+            agent=agent,
+            role=role,
+            content_preview=content[:500],
+            content_chars=len(content),
+            iteration_dropped=iteration,
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -438,4 +484,5 @@ class NoOpLedger:
     def record_memory_search(self, **_: Any) -> None: pass
     def record_routing_decision(self, **_: Any) -> None: pass
     def record_compression(self, **_: Any) -> None: pass
+    def record_dropped_message(self, **_: Any) -> None: pass
     def close(self) -> None: pass

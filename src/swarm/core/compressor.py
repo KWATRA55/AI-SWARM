@@ -441,7 +441,14 @@ class Compressor:
             f"[{m.get('role', 'unknown')}] {m.get('content', '')}"
             for m in conversation_history[-30:]  # Last 30 messages max
         )
-        errors_text = "\n".join(task_errors or [])
+        # V2: Deduplicate and cap errors to last 5 unique to prevent
+        # unbounded error accumulation bloating the extraction prompt.
+        _raw_errors = task_errors or []
+        _seen: dict[str, None] = {}
+        for err in reversed(_raw_errors):
+            _seen.setdefault(err, None)
+        _unique_errors = list(_seen.keys())[:5]
+        errors_text = "\n".join(reversed(_unique_errors))
 
         # Extract via LLM
         entries = await self._call_extraction_llm(

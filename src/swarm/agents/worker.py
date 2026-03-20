@@ -486,13 +486,12 @@ class WorkerAgent:
                             "error": f"Tool execution crashed: {tool_exc}",
                         })
 
-                    # Truncate large tool outputs to save tokens
-                    _MAX_TOOL_OUTPUT_CHARS = 4_000  # ~1K tokens (was 8K)
+                    # Truncate large tool outputs to save tokens (V2.2: 4K→2K)
+                    _MAX_TOOL_OUTPUT_CHARS = 2_000  # ~500 tokens
                     if len(tool_result) > _MAX_TOOL_OUTPUT_CHARS:
                         tool_result = (
                             tool_result[:_MAX_TOOL_OUTPUT_CHARS]
-                            + f"\n\n[OUTPUT TRUNCATED — {len(tool_result):,} chars total, "
-                            f"showing first {_MAX_TOOL_OUTPUT_CHARS:,}]"
+                            + f"\n[TRUNCATED — {len(tool_result):,} chars]"
                         )
 
                     # Append tool result
@@ -503,11 +502,32 @@ class WorkerAgent:
                     })
 
                 # --- Post-write content scrubbing ---
-                # After write_file tool calls, the full file content sits in
-                # the assistant message's tool_call args. This can be 5K+
-                # tokens for a single file write. Scrub it to prevent
-                # re-sending the entire content on every subsequent LLM call.
                 self._scrub_write_file_content()
+
+                # --- Auto-complete: skip wasteful text-only TASK_COMPLETE call ---
+                # If the assistant's text already contains TASK_COMPLETE, we're done.
+                # Previously this would loop → make another 2-3K token text call.
+                if content and self._is_complete(content):
+                    summary = content
+                    await logger.info(
+                        "worker.task_complete_with_tools",
+                        agent=self.name,
+                        iteration=self._iteration,
+                    )
+                    break
+
+                # Also auto-complete if agent has written files and is past iter 2
+                _wrote_files = any(
+                    tc.function.name == "write_file"
+                    for tc in message.tool_calls
+                    if hasattr(tc, 'function')
+                )
+                if _wrote_files and self._iteration >= 3:
+                    # Inject completion nudge — saves a full LLM round trip
+                    self._messages.append({
+                        "role": "user",
+                        "content": "Files written. If your task is complete, respond only with '[TASK_COMPLETE]' and a one-line summary.",
+                    })
 
                 # Log to state
                 await self._state.add_message(
@@ -517,7 +537,6 @@ class WorkerAgent:
                     content=f"[Tool calls: {len(message.tool_calls)}]",
                 )
 
-                # Continue loop — LLM needs to process tool results
                 continue
 
             # No tool calls — process text response
@@ -583,10 +602,10 @@ class WorkerAgent:
                 try:
                     args = json.loads(fn.get("arguments", "{}"))
                     content = args.get("content", "")
-                    if len(content) > 200:
+                    if len(content) > 80:
                         args["content"] = (
-                            content[:200]
-                            + f"\n... [{len(content):,} chars written]"
+                            content[:80]
+                            + f"\n[{len(content):,}ch written]"
                         )
                         fn["arguments"] = json.dumps(args)
                 except (json.JSONDecodeError, TypeError):

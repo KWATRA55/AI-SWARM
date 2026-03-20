@@ -873,17 +873,15 @@ class SwarmOrchestrator:
         """
         sections: list[str] = []
 
-        # Original system prompt
+        # Original system prompt (from YAML — kept minimal)
         sections.append(agent_config.system_prompt.strip())
 
-        # Task description
-        if task:
-            sections.append(f"\n--- CURRENT TASK ---\n{task}\n--- END TASK ---")
+        # NOTE: Task description is NOT included here — it's already in the
+        # worker's first user message. Duplicating it wastes ~125 tokens/call.
 
         # Workspace info (condensed — V2.1)
         sections.append(
-            f"Workspace: {self._config.workspace} | Role: {agent_config.role.value} "
-            f"| Model: {agent_config.model} | Max iters: {agent_config.max_iterations}"
+            f"Workspace: {self._config.workspace} | Role: {agent_config.role.value}"
         )
 
         # NOTE: Tools are NOT listed here — they are already sent via the
@@ -896,25 +894,16 @@ class SwarmOrchestrator:
         # Workspace bootstrap (directory snapshot from previous tiers)
         if workspace_context:
             sections.append(
-                "\n--- WORKSPACE BOOTSTRAP ---\n"
-                "Files already in workspace (from previous tiers). "
-                "Do NOT re-read these — use directly:\n\n"
-                f"{workspace_context}\n"
-                "--- END WORKSPACE BOOTSTRAP ---"
+                "--- WORKSPACE FILES ---\n"
+                f"{workspace_context}"
             )
 
         # Inter-agent context (summaries from previous tier agents)
         if tier_context:
             sections.append(
-                "\n--- PREVIOUS TIER RESULTS ---\n"
-                f"{tier_context}\n"
-                "--- END PREVIOUS TIER RESULTS ---"
+                "--- PREV TIER ---\n"
+                f"{tier_context}"
             )
-
-        # Completion signal (one line — was 4 lines)
-        sections.append(
-            "When done, include '[TASK_COMPLETE]' with a brief summary."
-        )
 
         return "\n\n".join(sections)
 

@@ -880,28 +880,14 @@ class SwarmOrchestrator:
         if task:
             sections.append(f"\n--- CURRENT TASK ---\n{task}\n--- END TASK ---")
 
-        # Workspace info
+        # Workspace info (condensed — V2.1)
         sections.append(
-            f"\n--- WORKSPACE ---\n"
-            f"Shared workspace: {self._config.workspace}\n"
-            f"Your role: {agent_config.role.value}\n"
-            f"Your model: {agent_config.model}\n"
-            f"Max iterations: {agent_config.max_iterations}\n"
-            f"--- END WORKSPACE ---"
+            f"Workspace: {self._config.workspace} | Role: {agent_config.role.value} "
+            f"| Model: {agent_config.model} | Max iters: {agent_config.max_iterations}"
         )
 
-        # MCP tools description
-        tool_list = agent_config.tools
-        if tool_list:
-            tools_desc = "\n".join(f"  • {t}" for t in tool_list)
-            sections.append(
-                f"\n--- AVAILABLE TOOLS ---\n"
-                f"You have access to the following tools via MCP:\n"
-                f"{tools_desc}\n"
-                f"\nAdditionally, you can search the team's long-term memory:\n"
-                f"  • search_memory(query) — Search past session knowledge\n"
-                f"--- END TOOLS ---"
-            )
+        # NOTE: Tools are NOT listed here — they are already sent via the
+        # OpenAI function-calling API. Listing them again wastes ~200-300 tokens.
 
         # Long-Term Memory context (from past sessions)
         if ltm_context:
@@ -911,9 +897,8 @@ class SwarmOrchestrator:
         if workspace_context:
             sections.append(
                 "\n--- WORKSPACE BOOTSTRAP ---\n"
-                "The following files already exist in the workspace (created by "
-                "agents in previous tiers). DO NOT re-read these with list_directory "
-                "— use the information below to start working immediately:\n\n"
+                "Files already in workspace (from previous tiers). "
+                "Do NOT re-read these — use directly:\n\n"
                 f"{workspace_context}\n"
                 "--- END WORKSPACE BOOTSTRAP ---"
             )
@@ -922,18 +907,13 @@ class SwarmOrchestrator:
         if tier_context:
             sections.append(
                 "\n--- PREVIOUS TIER RESULTS ---\n"
-                "The following agents completed before you. Use their output "
-                "as context — build on top of their work, don't duplicate it:\n\n"
                 f"{tier_context}\n"
                 "--- END PREVIOUS TIER RESULTS ---"
             )
 
-        # Completion signal instruction
+        # Completion signal (one line — was 4 lines)
         sections.append(
-            "\n--- COMPLETION ---\n"
-            "When you have fully completed your task, include '[TASK_COMPLETE]' "
-            "in your final response along with a summary of what was accomplished.\n"
-            "--- END COMPLETION ---"
+            "When done, include '[TASK_COMPLETE]' with a brief summary."
         )
 
         return "\n\n".join(sections)

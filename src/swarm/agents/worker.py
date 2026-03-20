@@ -263,17 +263,14 @@ class WorkerAgent:
         """The inner agentic loop."""
         from litellm import acompletion  # fallback if gateway unavailable
 
-        # Add initial task message with efficiency instructions
+        # Add initial task message with efficiency instructions (V2.1: compressed)
         self._messages.append({
             "role": "user",
             "content": (
-                f"Execute the following task:\n\n{task}\n\n"
-                f"**EFFICIENCY RULES (critical):**\n"
-                f"- Write ALL files in a SINGLE response using multiple tool calls.\n"
-                f"- Do NOT write one file, respond with text, then write the next.\n"
-                f"- Plan first, then execute all writes at once.\n"
-                f"- Only read files directly relevant to the task.\n"
-                f"- When finished, include '[TASK_COMPLETE]' with a brief summary.\n"
+                f"{task}\n\n"
+                f"RULES: Write ALL files in ONE response (parallel tool calls). "
+                f"Plan first, then execute. Read only what's needed. "
+                f"End with '[TASK_COMPLETE]' + summary."
             ),
         })
 
@@ -773,8 +770,8 @@ class WorkerAgent:
     # Algorithmic Sliding Window (V2 — zero-cost, no LLM)
     # -------------------------------------------------------------------
 
-    _WINDOW_KEEP_RECENT_PAIRS = 4     # assistant+tool pairs to keep in full
-    _WINDOW_TRIGGER_TOKENS = 2_500    # start windowing above this
+    _WINDOW_KEEP_RECENT_PAIRS = 2     # assistant+tool pairs to keep in full (V2.1: was 4, too generous)
+    _WINDOW_TRIGGER_TOKENS = 1_500    # start windowing above this (V2.1: was 2,500, too late)
     _STUB_MAX_CHARS = 50              # max chars for stubbed old messages
 
     async def _apply_sliding_window(self) -> None:

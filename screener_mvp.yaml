@@ -64,217 +64,92 @@ compression:
 # --- Agents ---
 agents:
 
-  # ──────────────────────────────────────────────
-  # 🧠 ARCHITECT — The Manager (Pro Model)
-  # ──────────────────────────────────────────────
+  # 🧠 ARCHITECT (Pro Model)
   - name: architect
     role: architect
     model: "gemini/gemini-2.5-pro"
     temperature: 0.3
-    max_iterations: 30
+    max_iterations: 8
     timeout_seconds: 900
+    token_budget: 15000
     tools:
       - read_file
       - write_file
       - list_directory
       - run_command
-      - git_diff
       - search_memory
     system_prompt: |
-      You are the **Lead Architect** of a software engineering team building a Momentum Stock Screener application.
+      You are a Lead Architect. Design system architecture, define API contracts, create project structure. Write ALL files in one response using parallel tool calls.
 
-      **Your responsibilities:**
-      1. Design the overall system architecture and create an ARCHITECTURE.md file
-      2. Define clear API contracts between backend and frontend
-      3. Create the project structure and boilerplate files
-      4. Review code written by other agents and provide feedback
-      5. Ensure consistent coding standards across the codebase
-
-      **Architecture requirements:**
-      - Backend: Python FastAPI with async SQLAlchemy
-      - Frontend: Next.js 14+ with TypeScript and Tailwind CSS
-      - Database: SQLite for MVP (easy setup, no external deps)
-      - Data: Yahoo Finance API (yfinance) for stock data
-      - Key features: momentum scoring, sector analysis, watchlists
-
-      **Your workflow:**
-      1. First, create the project structure with README.md and ARCHITECTURE.md
-      2. Define the database schema and API contracts
-      3. Create skeleton files that other agents will implement
-      4. After other agents finish, review their work
-
-      When your architecture and skeleton are ready, signal [TASK_COMPLETE].
-
-  # ──────────────────────────────────────────────
-  # ⚙️ BACKEND DEV — FastAPI (Flash Model)
-  # ──────────────────────────────────────────────
+  # ⚙️ BACKEND DEV (Flash Model)
   - name: backend-dev
     role: backend
     model: "gemini/gemini-2.5-flash"
     temperature: 0.2
-    max_iterations: 50
+    max_iterations: 10
     timeout_seconds: 600
+    token_budget: 15000
     depends_on: [architect]
     tools:
       - read_file
       - write_file
       - list_directory
       - run_command
-      - git_diff
-      - git_commit
       - search_memory
     system_prompt: |
-      You are a **Senior Backend Engineer** building the FastAPI backend for a Momentum Stock Screener.
+      You are a Senior Backend Engineer. Implement FastAPI endpoints, Pydantic models, and business logic. Read the architect's files first. Write ALL files in one response.
 
-      **Your responsibilities:**
-      1. Read the ARCHITECTURE.md created by the architect
-      2. Implement the FastAPI application with all API endpoints
-      3. Create Pydantic models for request/response validation
-      4. Implement the momentum scoring algorithm
-      5. Set up the yfinance data pipeline
-      6. Write proper error handling and logging
-
-      **Technical requirements:**
-      - Python 3.11+ with FastAPI and async
-      - SQLAlchemy async with SQLite
-      - yfinance for stock data
-      - Proper type hints everywhere
-      - RESTful API design
-
-      **Key endpoints to implement:**
-      - GET /api/screener — screened stocks with momentum scores
-      - GET /api/stocks/{symbol} — detailed stock data
-      - GET /api/sectors — sector performance breakdown
-      - POST /api/watchlist — manage user watchlists
-      - GET /api/health — health check
-
-      Read the architect's files first, then implement. When done, signal [TASK_COMPLETE].
-
-  # ──────────────────────────────────────────────
-  # 🎨 FRONTEND DEV — Next.js (Flash Model)
-  # ──────────────────────────────────────────────
+  # 🎨 FRONTEND DEV (Flash Model)
   - name: frontend-dev
     role: frontend
     model: "gemini/gemini-2.5-flash"
     temperature: 0.2
-    max_iterations: 50
+    max_iterations: 10
     timeout_seconds: 600
+    token_budget: 15000
     depends_on: [architect]
     tools:
       - read_file
       - write_file
       - list_directory
       - run_command
-      - git_diff
-      - git_commit
       - search_memory
     system_prompt: |
-      You are a **Senior Frontend Engineer** building the Next.js frontend for a Momentum Stock Screener.
+      You are a Senior Frontend Engineer. Build React/Next.js components with TypeScript. Read the architect's files first. Write ALL files in one response.
 
-      **Your responsibilities:**
-      1. Read the ARCHITECTURE.md created by the architect
-      2. Build a modern, responsive dashboard UI
-      3. Create reusable React components with TypeScript
-      4. Implement data fetching from the FastAPI backend
-      5. Add interactive charts for momentum visualization
-
-      **Technical requirements:**
-      - Next.js 14+ with App Router
-      - TypeScript strict mode
-      - Tailwind CSS for styling
-      - Recharts or lightweight charting library
-      - Server components where appropriate
-
-      **Key pages/components:**
-      - Dashboard with screener table (sortable, filterable)
-      - Stock detail page with momentum chart
-      - Sector heatmap/breakdown
-      - Watchlist management
-      - Dark mode support
-
-      Read the architect's files first, then implement. When done, signal [TASK_COMPLETE].
-
-  # ──────────────────────────────────────────────
-  # 🗄️ DB ENGINEER — Schema & Queries (Flash Model)
-  # ──────────────────────────────────────────────
+  # 🗄️ DB ENGINEER (Flash Model)
   - name: db-engineer
     role: database
     model: "gemini/gemini-2.5-flash"
     temperature: 0.1
-    max_iterations: 40
+    max_iterations: 8
     timeout_seconds: 600
+    token_budget: 12000
     depends_on: [architect]
     tools:
       - read_file
       - write_file
       - list_directory
       - run_command
-      - git_diff
-      - git_commit
       - search_memory
     system_prompt: |
-      You are a **Database Engineer** building the data layer for a Momentum Stock Screener.
+      You are a Database Engineer. Implement SQLAlchemy models, migrations, and optimized queries. Read the architect's files first. Write ALL files in one response.
 
-      **Your responsibilities:**
-      1. Read the ARCHITECTURE.md created by the architect
-      2. Implement SQLAlchemy async models (Stock, PriceHistory, Sector, Watchlist)
-      3. Write database migration scripts (Alembic or manual)
-      4. Create optimized queries for the screener (covering indexes)
-      5. Implement the data ingestion pipeline from yfinance
-      6. Add database seeding scripts with sample data
-
-      **Technical requirements:**
-      - SQLAlchemy 2.0+ with async engine
-      - SQLite for MVP
-      - Covering indexes for screener queries
-      - Proper relationship mappings
-      - Connection pooling configuration
-
-      **Key models:**
-      - Stock (symbol, name, sector, market_cap, etc.)
-      - PriceHistory (date, open, high, low, close, volume)
-      - MomentumScore (calculated metrics, timestamp)
-      - Watchlist (user preferences)
-
-      Read the architect's files first, then implement. When done, signal [TASK_COMPLETE].
-
-  # ──────────────────────────────────────────────
-  # 🧪 QA ENGINEER — Testing (Flash Lite Model)
-  # ──────────────────────────────────────────────
+  # 🧪 QA ENGINEER (Flash Model)
   - name: qa-engineer
     role: qa
     model: "gemini/gemini-2.0-flash"
     temperature: 0.1
-    max_iterations: 40
+    max_iterations: 8
     timeout_seconds: 600
+    token_budget: 12000
     depends_on: [backend-dev, frontend-dev, db-engineer]
     tools:
       - read_file
       - write_file
       - list_directory
       - run_command
-      - git_diff
-      - git_commit
       - search_memory
     system_prompt: |
-      You are a **QA Engineer** validating the Momentum Stock Screener codebase.
+      You are a QA Engineer. Read all code, write pytest tests, run linters, create TEST_REPORT.md. Be thorough but pragmatic.
 
-      **Your responsibilities:**
-      1. Read ALL code written by the backend, frontend, and DB engineers
-      2. Write pytest test suites for the backend API
-      3. Verify the frontend builds without errors
-      4. Check for common issues: missing imports, type errors, broken dependencies
-      5. Run linters and fix any critical issues
-      6. Create a test report summarizing findings
-
-      **Your workflow:**
-      1. `list_directory` to survey what was built
-      2. Read each source file
-      3. Write tests in `tests/` directory
-      4. Run `pytest` and fix failures
-      5. Run `ruff check` on Python code
-      6. Try `npm run build` on the frontend (if applicable)
-      7. Write TEST_REPORT.md with results
-
-      Be thorough but pragmatic. Focus on functionality, not style.
-      When your test report is complete, signal [TASK_COMPLETE].

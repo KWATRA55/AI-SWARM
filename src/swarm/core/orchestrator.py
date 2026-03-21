@@ -614,7 +614,9 @@ class SwarmOrchestrator:
                     "agent": agent_config.name, "error": error_msg,
                 })
                 results[agent_config.name] = {
-                    "status": "failed", "error": error_msg,
+                    "status": "failed",
+                    "result": {"status": "failed", "error": error_msg},
+                    "error": error_msg,
                 }
 
         # Launch all agents in parallel — failures are isolated
@@ -752,6 +754,7 @@ class SwarmOrchestrator:
 
             results[agent_name] = {
                 "status": "failed",
+                "result": {"status": "failed", "error": error_msg},
                 "error": error_msg,
                 "elapsed_seconds": round(elapsed, 2),
             }
@@ -937,6 +940,9 @@ class SwarmOrchestrator:
             ]
 
             level = root.replace(str(workspace), '').count(os.sep)
+            if level > 1:  # Restrict depth to prevent token bloat
+                continue
+
             indent = '  ' * level
             basename = os.path.basename(root)
             lines.append(f"{indent}{basename}/")
@@ -954,11 +960,13 @@ class SwarmOrchestrator:
                     lines.append(f"{sub_indent}{file}")
                     file_count += 1
 
-            if file_count > 100:
-                lines.append('  ... (truncated at 100 files)')
+            if file_count > 50:
                 break
 
-        return '\n'.join(lines) if lines else '(empty workspace)'
+        if lines:
+            lines.append("\n[Directory tree truncated. Use 'list_directory' tool to explore further.]")
+            return '\n'.join(lines)
+        return '(empty workspace)'
 
     async def _dispatch_helper_agent(
         self,

@@ -117,7 +117,7 @@ class LLMGateway:
         self._total_requests += 1
 
         # --- 1. Check semantic cache ---
-        cache_key = self._build_cache_key(model, messages)
+        cache_key = self._build_cache_key(model, messages, agent_name)
         cached = await self._cache_lookup(cache_key)
         if cached is not None:
             self._cache_hits += 1
@@ -163,6 +163,9 @@ class LLMGateway:
                     # 75-90% cache hit rates on frozen system prompts.
                     _model_lower = try_model.lower()
                     if "anthropic" in _model_lower or "claude" in _model_lower:
+                        import copy
+                        # Deep copy messages so we don't mutate the agent's internal state!
+                        call_kwargs["messages"] = copy.deepcopy(call_kwargs["messages"])
                         # Anthropic: add cache_control breakpoint to system msg
                         call_kwargs.setdefault("extra_headers", {})
                         call_kwargs["extra_headers"]["anthropic-beta"] = (
@@ -181,6 +184,12 @@ class LLMGateway:
                                         }
                                     ]
                                 break  # Only tag the first system message
+                    elif "gemini" in _model_lower:
+                        # For Gemini Context Caching in LiteLLM:
+                        # Passing `cache=True` might trigger LiteLLM's internal caching or just use default.
+                        # Wait, litellm supports native Gemini caching?
+                        # No need to mutate messages for Gemini. We can just pass standard LiteLLM kwargs if needed.
+                        pass
 
                     response = await acompletion(**call_kwargs)
 
@@ -252,14 +261,13 @@ class LLMGateway:
     # -------------------------------------------------------------------
 
     def _build_cache_key(
-        self, model: str, messages: list[dict[str, Any]],
+        self, model: str, messages: list[dict[str, Any]], agent_name: str
     ) -> str:
-        """Build a cache key from model + user intent (not system prompt).
+        """Build a cache key from model + user intent.
 
-        V2 improvement: strips volatile system prompt and tool results,
-        hashing only the core user messages. This dramatically increases
-        cache hit rates when different agents ask similar questions, or
-        when the same agent retries after a system prompt timestamp change.
+        Includes the `agent_name` to namespace cache hits per agent, preventing
+        cross-agent hallucinations. Strips volatile system prompt and tool
+        results, hashing only the core user messages.
         """
         import re
 
@@ -275,7 +283,7 @@ class LLMGateway:
                 if clean:
                     user_parts.append(clean)
 
-        raw = f"{model}:{'|'.join(user_parts[-3:])}"  # last 3 user messages
+        raw = f"{agent_name}:{model}:{'|'.join(user_parts[-3:])}"  # last 3 user messages
         return hashlib.sha256(raw.encode()).hexdigest()
 
     async def _cache_lookup(self, cache_key: str) -> Any | None:

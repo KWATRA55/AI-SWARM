@@ -895,20 +895,29 @@ class WorkerAgent:
         pinned = self._messages[:2]              # system prompt + task
         body   = self._messages[2:]              # everything else
 
-        # Keep last N*2 messages (each pair = assistant+tool)
+        # Keep approximately last N*2 messages (each pair = assistant+tool)
         keep_count = self._WINDOW_KEEP_RECENT_PAIRS * 2
         if len(body) <= keep_count:
             return  # Nothing to drop
 
-        to_drop = body[:-keep_count]
-        to_keep = body[-keep_count:]
+        # Ensure we don't split an assistant message from its tool responses
+        split_idx = len(body) - keep_count
+        while split_idx > 0 and body[split_idx].get("role") == "tool":
+            split_idx -= 1
+
+        to_drop = body[:split_idx]
+        to_keep = body[split_idx:]
+
+        if not to_drop:
+            return
 
         # --- Archive dropped messages to telemetry ledger ---
         for msg in to_drop:
+            content = msg.get("content", "") or ""
             self._ledger.record_dropped_message(
                 agent=self.name,
                 role=msg.get("role", "unknown"),
-                content=msg.get("content", "")[:500],
+                content=content[:500],
                 iteration=self._iteration,
             )
 

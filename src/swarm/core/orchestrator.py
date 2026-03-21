@@ -58,6 +58,7 @@ Lifecycle
 from __future__ import annotations
 
 import asyncio
+import shlex
 import signal
 import time
 from collections import defaultdict
@@ -791,8 +792,13 @@ class SwarmOrchestrator:
                     agent_name, command, timeout=timeout,
                 )
             # Local fallback — subprocess
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            args = shlex.split(command)
+            if not args:
+                return (0, "")
+
+            proc = await asyncio.create_subprocess_exec(
+                args[0],
+                *args[1:],
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(self._config.workspace),

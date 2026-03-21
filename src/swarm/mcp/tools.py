@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import subprocess
 import uuid
 from pathlib import Path
@@ -685,8 +686,13 @@ class ToolExecutor:
         # Fallback: local subprocess
         try:
             workdir = params.workdir or str(self._workspace)
-            proc = await asyncio.create_subprocess_shell(
-                params.command,
+            args = shlex.split(params.command)
+            if not args:
+                return ToolResult(success=False, error="Empty command.")
+
+            proc = await asyncio.create_subprocess_exec(
+                args[0],
+                *args[1:],
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=workdir,

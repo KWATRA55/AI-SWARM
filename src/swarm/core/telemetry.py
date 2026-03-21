@@ -157,11 +157,8 @@ class SessionLedger:
     """Append-only JSONL ledger for session replay.
 
     V2.3 FIX: Uses a **sync file handle** opened in ``__init__`` (which runs
-    outside an event loop) so telemetry works immediately.  A background
-    async consumer can optionally be started later via ``start_async()``.
+    outside an event loop) so telemetry works immediately.
     """
-
-    _SENTINEL = object()  # Drain signal for graceful shutdown
 
     def __init__(
         self,
@@ -431,6 +428,8 @@ class SessionLedger:
                 self._file_handle.close()
             except Exception:
                 pass
+            finally:
+                self._file_handle = None
 
         # Use stdlib logging (not async structlog) since close() is sync
         import logging

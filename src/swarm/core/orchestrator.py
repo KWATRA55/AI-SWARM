@@ -86,7 +86,7 @@ from swarm.mcp.server import MCPServerFactory
 from swarm.mcp.tools import ToolExecutor
 from swarm.agents.worker import WorkerAgent
 from swarm.infra.rate_limiter import SwarmRateLimiter
-from swarm.infra.env import inject_sandbox_env, load_env
+from swarm.infra.env import inject_sandbox_env
 from swarm.core.telemetry import SessionLedger, NoOpLedger
 
 logger = structlog.get_logger(__name__)

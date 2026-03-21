@@ -458,9 +458,12 @@ class ToolExecutor:
         params = ReadFileInput.model_validate(args)
         target = self._resolve_path(params.path)
 
-        if not target.exists():
+        exists = await asyncio.to_thread(target.exists)
+        if not exists:
             return ToolResult(success=False, error=f"File not found: {params.path}")
-        if not target.is_file():
+
+        is_file = await asyncio.to_thread(target.is_file)
+        if not is_file:
             return ToolResult(success=False, error=f"Not a file: {params.path}")
 
         # Acquire read lock (MRSW) if event bus is available
@@ -473,7 +476,7 @@ class ToolExecutor:
                 read_lock = None  # fall through to unlocked read
 
         try:
-            content = target.read_text(encoding="utf-8")
+            content = await asyncio.to_thread(target.read_text, encoding="utf-8")
             total_lines = content.count("\n") + 1
 
             # --- AST-based structure summary (Phase 3) ---
@@ -500,10 +503,11 @@ class ToolExecutor:
             if truncated:
                 content = content[:_MAX] + f"\n... [TRUNCATED — {len(content):,} chars total, {total_lines} lines. Use start_line/end_line or structure_only=true.]"
 
+            size = await asyncio.to_thread(lambda: target.stat().st_size)
             return ToolResult(
                 success=True,
                 output=content,
-                metadata={"path": str(target), "size": target.stat().st_size, "lines": total_lines},
+                metadata={"path": str(target), "size": size, "lines": total_lines},
             )
         except UnicodeDecodeError:
             return ToolResult(
@@ -577,10 +581,13 @@ class ToolExecutor:
         self, target: Path, content: str, create_dirs: bool,
     ) -> ToolResult:
         """Direct file write with local asyncio lock (fallback mode)."""
-        try:
+        def _write_sync() -> None:
             if create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+
+        try:
+            await asyncio.to_thread(_write_sync)
             return ToolResult(
                 success=True,
                 output=f"File written: {target} ({len(content)} bytes)",
@@ -598,40 +605,45 @@ class ToolExecutor:
         params = ListDirectoryInput.model_validate(args)
         target = self._resolve_path(params.path)
 
-        if not target.exists():
+        exists = await asyncio.to_thread(target.exists)
+        if not exists:
             return ToolResult(success=False, error=f"Directory not found: {params.path}")
-        if not target.is_dir():
+
+        is_dir = await asyncio.to_thread(target.is_dir)
+        if not is_dir:
             return ToolResult(success=False, error=f"Not a directory: {params.path}")
 
         entries: list[str] = []
 
-        def _walk(dir_path: Path, depth: int = 0, prefix: str = "") -> None:
-            if depth > params.max_depth:
-                return
-            try:
-                items = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
-                for item in items:
-                    # Skip hidden files and common ignore patterns
-                    if item.name.startswith(".") or item.name in {
-                        "node_modules", "__pycache__", ".git", ".venv", "venv",
-                    }:
-                        continue
+        def _walk_sync() -> None:
+            def _walk(dir_path: Path, depth: int = 0, prefix: str = "") -> None:
+                if depth > params.max_depth:
+                    return
+                try:
+                    items = sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name))
+                    for item in items:
+                        # Skip hidden files and common ignore patterns
+                        if item.name.startswith(".") or item.name in {
+                            "node_modules", "__pycache__", ".git", ".venv", "venv",
+                        }:
+                            continue
 
-                    rel = item.resolve().relative_to(self._workspace)
-                    if item.is_dir():
-                        entries.append(f"[DIR] {rel}")
-                        if params.recursive:
-                            _walk(item, depth + 1, prefix)
-                    else:
-                        entries.append(f"[FILE] {rel}")
+                        rel = item.resolve().relative_to(self._workspace)
+                        if item.is_dir():
+                            entries.append(f"[DIR] {rel}")
+                            if params.recursive:
+                                _walk(item, depth + 1, prefix)
+                        else:
+                            entries.append(f"[FILE] {rel}")
 
-                    if len(entries) > 50:  # Token-saving cap
-                        entries.append("... (truncated at 50 entries)")
-                        return
-            except PermissionError:
-                entries.append(f"{prefix}[permission denied]")
+                        if len(entries) > 50:  # Token-saving cap
+                            entries.append("... (truncated at 50 entries)")
+                            return
+                except PermissionError:
+                    entries.append(f"{prefix}[permission denied]")
+            _walk(target)
 
-        _walk(target)
+        await asyncio.to_thread(_walk_sync)
         return ToolResult(
             success=True,
             output="\n".join(entries) if entries else "(empty directory)",

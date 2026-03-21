@@ -44,26 +44,27 @@ that the main loop checks between iterations.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from swarm.config.models import AgentConfig, CompressionConfig
-from swarm.core.compressor import Compressor, count_tokens
 from swarm.core.state import (
     AgentStatus,
     MessageRole,
     SwarmState,
-    TaskStatus,
     TokenUsage,
 )
-from swarm.events.bus import EventBus, SwarmEvent
-from swarm.events.channels import BroadcastChannel
-from swarm.mcp.tools import ToolExecutor
 from swarm.core.telemetry import NoOpLedger
+from swarm.events.channels import BroadcastChannel
+
+if TYPE_CHECKING:
+    from swarm.config.models import AgentConfig
+    from swarm.core.compressor import Compressor
+    from swarm.events.bus import EventBus, SwarmEvent
+    from swarm.mcp.tools import ToolExecutor
 
 logger = structlog.get_logger(__name__)
 
@@ -423,7 +424,7 @@ class WorkerAgent:
                 if response.usage:
                     llm_tokens = response.usage.total_tokens or 0
                 if self._dashboard_callback:
-                    try:
+                    with contextlib.suppress(Exception):
                         await self._dashboard_callback("llm_call", {
                             "agent": self.name,
                             "model": self._config.model,
@@ -436,8 +437,6 @@ class WorkerAgent:
                             "files_written": self._file_writes,
                             "files_read": self._file_reads,
                         })
-                    except Exception:
-                        pass
 
             except Exception as exc:
                 consecutive_errors += 1
@@ -703,13 +702,11 @@ class WorkerAgent:
 
         # Broadcast to dashboard
         if self._dashboard_callback:
-            try:
+            with contextlib.suppress(Exception):
                 await self._dashboard_callback("tool_call", {
                     "agent": self.name, "tool": tool_name,
                     "args_preview": arguments,
                 })
-            except Exception:
-                pass
 
         result = await self._executor.execute(tool_name, arguments)
         _tool_duration = (time.monotonic() - _tool_start) * 1000
@@ -784,10 +781,8 @@ class WorkerAgent:
         """Stop the interrupt listener."""
         if self._interrupt_listener_task is not None:
             self._interrupt_listener_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._interrupt_listener_task
-            except asyncio.CancelledError:
-                pass
             self._interrupt_listener_task = None
 
     async def _listen_for_interrupts(self) -> None:
@@ -891,78 +886,94 @@ class WorkerAgent:
 
         msgs_before = len(self._messages)
 
-        # --- Partition messages ---
+        # --- Partition messages into Atomic Blocks ---
         pinned = self._messages[:2]              # system prompt + task
-        body   = self._messages[2:]              # everything else
+        body = self._messages[2:]              # everything else
 
-        # Keep last N*2 messages (each pair = assistant+tool)
-        keep_count = self._WINDOW_KEEP_RECENT_PAIRS * 2
-        if len(body) <= keep_count:
+        blocks = []
+        current_block = []
+
+        for msg in body:
+            role = msg.get("role")
+            if role == "user" or (role == "assistant" and "tool_calls" not in msg):
+                if current_block:
+                    blocks.append(current_block)
+                    current_block = []
+                blocks.append([msg])
+            elif role == "assistant" and "tool_calls" in msg:
+                if current_block:
+                    blocks.append(current_block)
+                current_block = [msg]
+            elif role == "tool":
+                current_block.append(msg)
+            else:
+                if current_block:
+                    blocks.append(current_block)
+                    current_block = []
+                blocks.append([msg])
+
+        if current_block:
+            blocks.append(current_block)
+
+        # Keep last N blocks (instead of N*2 messages)
+        keep_count = self._WINDOW_KEEP_RECENT_PAIRS
+        if len(blocks) <= keep_count:
             return  # Nothing to drop
 
-        to_drop = body[:-keep_count]
-        to_keep = body[-keep_count:]
+        blocks_to_drop = blocks[:-keep_count]
+        blocks_to_keep = blocks[-keep_count:]
 
         # --- Archive dropped messages to telemetry ledger ---
-        for msg in to_drop:
-            self._ledger.record_dropped_message(
-                agent=self.name,
-                role=msg.get("role", "unknown"),
-                content=msg.get("content", "")[:500],
-                iteration=self._iteration,
-            )
+        for block in blocks_to_drop:
+            for msg in block:
+                self._ledger.record_dropped_message(
+                    agent=self.name,
+                    role=msg.get("role", "unknown"),
+                    content=(msg.get("content") or "")[:500],
+                    iteration=self._iteration,
+                )
 
-        # --- Stub dropped messages (V2.4: merge assistant+tool pairs) ---
-        # Gemini SDK validates that every `tool` role message has a
-        # matching `tool_calls` entry in a preceding `assistant` message.
-        # We must merge tool results INTO the assistant stub to avoid
-        # orphaned tool messages.
+        # --- Stub dropped blocks ---
+        # We must replace the entire dropped block with a single plain-text stub
+        # to preserve semantic lineage without violating Gemini's strict API schema.
         stubs: list[dict[str, str]] = []
-        for msg in to_drop:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "") or ""
+        for block in blocks_to_drop:
+            if not block:
+                continue
 
-            if role == "assistant" and "tool_calls" in msg:
-                # Start an assistant stub that will absorb following tool results
+            first_msg = block[0]
+            role = first_msg.get("role", "unknown")
+            content = first_msg.get("content") or ""
+
+            if role == "assistant" and "tool_calls" in first_msg:
+                # Atomic Tool Block: flatten into a single user message
                 tool_names = []
-                for tc in msg.get("tool_calls", []):
+                for tc in first_msg.get("tool_calls", []):
                     fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
                     if fn:
                         name = fn.get("name", "?") if isinstance(fn, dict) else getattr(fn, "name", "?")
                         tool_names.append(name)
-                stubs.append({"role": "assistant", "content": f"[used tools: {','.join(tool_names)}]"})
 
-            elif role == "tool":
-                # MERGE into the last assistant stub (never create standalone tool msgs)
-                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                if stubs and stubs[-1]["role"] == "assistant":
-                    # Append result to existing assistant stub
-                    stubs[-1]["content"] += f" → {preview}"
-                else:
-                    # Orphan tool msg with no preceding assistant — convert to user context
-                    stubs.append({"role": "user", "content": f"[prior tool result: {preview}]"})
-
-            elif role == "assistant":
-                # Plain text assistant msg — merge with prev assistant if consecutive
-                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                if stubs and stubs[-1]["role"] == "assistant":
-                    stubs[-1]["content"] += f" | {preview}"
-                else:
-                    stubs.append({"role": "assistant", "content": f"[prev: {preview}]"})
-
-            elif role == "user":
-                # User msgs — merge consecutive
-                preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                if stubs and stubs[-1]["role"] == "user":
-                    stubs[-1]["content"] += f" | {preview}"
-                else:
-                    stubs.append({"role": role, "content": f"[prev: {preview}]"})
-
+                tools_str = ",".join(tool_names)
+                stubs.append({
+                    "role": "user",
+                    "content": f"[SYSTEM CONTEXT DROPPED: The agent executed tools '{tools_str}'. Result truncated to save tokens.]"
+                })
             else:
+                # Normal user/assistant message: flatten into a stub
                 preview = content[:self._STUB_MAX_CHARS].replace("\n", " ")
-                stubs.append({"role": role, "content": f"[prev: {preview}]"})
+                # Map to standard roles
+                stub_role = role if role in ["user", "assistant"] else "user"
+                if stubs and stubs[-1]["role"] == stub_role:
+                    stubs[-1]["content"] += f" | [prev: {preview}]"
+                else:
+                    stubs.append({"role": stub_role, "content": f"[prev: {preview}]"})
 
         # --- Rebuild messages ---
+        to_keep = []
+        for block in blocks_to_keep:
+            to_keep.extend(block)
+
         self._messages = pinned + stubs + to_keep
 
         await logger.info(
@@ -971,7 +982,7 @@ class WorkerAgent:
             actual_prompt_tokens=actual,
             messages_before=msgs_before,
             messages_after=len(self._messages),
-            dropped=len(to_drop),
+            dropped=len(blocks_to_drop),
             stubbed=len(stubs),
         )
 

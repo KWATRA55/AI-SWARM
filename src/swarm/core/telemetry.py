@@ -422,6 +422,20 @@ class SessionLedger:
             duration_seconds=round(elapsed, 2),
         ))
 
+    def flush(self) -> None:
+        """Flush buffered data to disk WITHOUT closing the file handle.
+
+        V2.4 FIX: Use this instead of close() when you need to preserve
+        telemetry for the rest of the session (e.g., on dashboard pause).
+        Previously pause_all_agents() called close() which permanently
+        killed the file handle, causing iterations 3+ to go unrecorded.
+        """
+        if self._file_handle is not None:
+            try:
+                self._file_handle.flush()
+            except Exception:
+                pass
+
         # Close the file handle — all events are already flushed
         if self._file_handle is not None:
             try:

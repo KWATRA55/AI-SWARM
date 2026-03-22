@@ -58,6 +58,7 @@ from swarm.core.state import (
     TokenUsage,
 )
 from swarm.core.telemetry import NoOpLedger
+from swarm.core.compliance import ToolComplianceProxy
 from swarm.events.channels import BroadcastChannel
 
 if TYPE_CHECKING:
@@ -141,7 +142,17 @@ class WorkerAgent:
     ) -> None:
         self._config = config
         self._state = state
-        self._executor = tool_executor
+        self._raw_executor = tool_executor  # Keep raw for descriptor access
+        # V2.7 → Aegis: Wrap with zero-trust compliance proxy
+        self._executor = ToolComplianceProxy(
+            registry=tool_executor,
+            agent_name=config.name,
+            agent_role=config.role.value if hasattr(config.role, 'value') else str(config.role),
+            workspace=str(getattr(tool_executor, '_workspace', '')),
+            max_reads=8,
+            max_cmd_failures=3,
+            ledger=ledger,
+        )
         self._compressor = compressor
         self._event_bus = event_bus
         self._dashboard_callback = dashboard_callback  # async fn(event_type, data)
@@ -161,6 +172,8 @@ class WorkerAgent:
         self._file_reads = 0
         self._budget_warned = False
         self._last_prompt_tokens = 0  # Track ACTUAL API prompt tokens for compression
+        self._consecutive_cmd_failures = 0  # V2.5: circuit breaker for run_command
+        self._consecutive_read_iters = 0   # V2.6: read-loop breaker
 
         # LLM Gateway for fallback routing and caching
         try:
@@ -242,7 +255,7 @@ class WorkerAgent:
             error_msg = f"{type(exc).__name__}: {exc}"
             await logger.error(
                 "worker.execution_failed",
-                agent=self.name,
+                agent_name=self.name,
                 error=error_msg,
             )
             return {
@@ -282,12 +295,20 @@ class WorkerAgent:
             "role": "user",
             "content": (
                 f"{task}\n\n"
+                f"WORKSPACE: {self._config.name} (files are relative to workspace root).\n"
                 f"RULES: Write ALL files in ONE response (parallel tool calls). "
                 f"Plan first, then execute. Read only what's needed. "
+                f"Do NOT read the same file twice. "
                 f"Use search_memory to check for relevant past knowledge before starting. "
+                f"IMPORTANT: Only create/modify files directly related to this task. "
+                f"Do NOT rewrite existing files unless the task explicitly asks for it. "
                 f"End with '[TASK_COMPLETE]' + summary."
             ),
         })
+
+        # Store the task text for re-injection (V2.6: prevents hallucination drift)
+        # Truncate to 500 chars — the full enhanced_prompt can be huge
+        self._original_task = task[:500]
 
         summary = ""
         consecutive_errors = 0
@@ -297,10 +318,22 @@ class WorkerAgent:
         # Agents kept ignoring search_memory — so we do it programmatically.
         if self._executor._compressor is not None:
             try:
-                # Extract a search query from the task (first 100 chars)
-                _mem_query = task[:100].strip()
+                # V2.7: Use the stored original task, not the enhanced_prompt
+                # (enhanced_prompt starts with system prompt persona text)
+                _mem_query = self._original_task[:150].strip()
                 memories = await self._executor._compressor.search_memories(
                     _mem_query, limit=3,
+                )
+                # V2.5: Always log memory search (even empty) for replay diagnostics
+                top_sim = 0.0
+                if memories:
+                    top_sim = max(m.confidence for m in memories) if memories else 0.0
+                self._ledger.record_memory_search(
+                    agent=self.name,
+                    query=_mem_query,
+                    results_count=len(memories),
+                    top_similarity=top_sim,
+                    cache_hit=False,
                 )
                 if memories:
                     mem_lines = []
@@ -314,22 +347,21 @@ class WorkerAgent:
                             f"Use this context to avoid re-doing work that's already been done."
                         ),
                     })
-                    self._ledger.record_memory_search(
-                        agent=self.name,
-                        query=_mem_query,
-                        results_count=len(memories),
-                        top_similarity=0.0,
-                        cache_hit=False,
-                    )
                     await logger.info(
                         "worker.auto_memory_injected",
-                        agent=self.name,
+                        agent_name=self.name,
                         memories_found=len(memories),
+                    )
+                else:
+                    await logger.info(
+                        "worker.auto_memory_empty",
+                        agent_name=self.name,
+                        msg="No prior memories found (first run?).",
                     )
             except Exception as exc:
                 await logger.warning(
                     "worker.auto_memory_failed",
-                    agent=self.name,
+                    agent_name=self.name,
                     error=str(exc),
                 )
 
@@ -341,6 +373,89 @@ class WorkerAgent:
             budget = self._config.token_budget
             used = self._total_tokens.total_tokens
 
+            # ═══════════════════════════════════════════════════════════
+            # V2.6: EFFICIENCY WATCHDOG — 3-tier waste prevention
+            # ═══════════════════════════════════════════════════════════
+            budget_pct = used / max(budget, 1)
+
+            # TIER 3: 75% budget with 0 writes → AUTO-KILL (waste prevention)
+            if budget_pct >= 0.75 and self._file_writes == 0 and self._iteration >= 3:
+                await logger.error(
+                    "worker.efficiency_kill",
+                    agent_name=self.name,
+                    tokens=used,
+                    budget=budget,
+                    iterations=self._iteration,
+                    reads=self._file_reads,
+                    writes=0,
+                )
+                summary = (
+                    f"[TASK_COMPLETE] Agent terminated — burned {used:,}/{budget:,} tokens "
+                    f"({budget_pct:.0%}) across {self._iteration} iterations with ZERO files "
+                    f"written. Task needs re-delegation with clearer instructions."
+                )
+                # Record waste event
+                self._ledger.record_llm_call(
+                    agent=self.name,
+                    model=self._config.model,
+                    messages=[],
+                    response_text=f"[EFFICIENCY_KILL] {summary}",
+                    tool_calls=None,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    cumulative_tokens=used,
+                    iteration=self._iteration,
+                    wall_clock_ms=0,
+                )
+                break
+
+            # TIER 2: 60% budget with 0 writes → FORCE FINALIZE
+            if budget_pct >= 0.60 and self._file_writes == 0 and not getattr(self, '_force_finalized', False):
+                self._force_finalized = True
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        f"⚠️ CRITICAL: You have used {budget_pct:.0%} of your token budget "
+                        f"({used:,}/{budget:,}) and written ZERO files. "
+                        f"STOP READING. YOU HAVE ENOUGH CONTEXT. "
+                        f"Call write_file for EVERY file you need to create, RIGHT NOW, "
+                        f"in this NEXT response. Use parallel tool calls to batch all writes. "
+                        f"If you cannot determine the correct file content, write your best "
+                        f"effort — partial output is better than NONE. "
+                        f"FAILURE TO WRITE FILES = TERMINATION."
+                    ),
+                })
+                await logger.warning(
+                    "worker.efficiency_force_finalize",
+                    agent_name=self.name,
+                    tokens=used,
+                    budget=budget,
+                    budget_pct=f"{budget_pct:.0%}",
+                )
+
+            # TIER 1: 40% budget with 0 writes → NUDGE
+            elif budget_pct >= 0.40 and self._file_writes == 0 and not getattr(self, '_efficiency_nudged', False):
+                self._efficiency_nudged = True
+                self._messages.append({
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM: You've used {budget_pct:.0%} of your token budget "
+                        f"({used:,}/{budget:,}) and written 0 files. "
+                        f"You have read enough context. On your NEXT response, "
+                        f"call write_file for all files you need to create/modify. "
+                        f"Use parallel tool calls to batch all writes together. "
+                        f"Continued reading will lead to termination."
+                    ),
+                })
+                await logger.info(
+                    "worker.efficiency_nudge",
+                    agent_name=self.name,
+                    tokens=used,
+                    budget=budget,
+                )
+
+            # --- Legacy budget enforcement ---
             # 90% soft warning — inject finalization prompt
             if used > budget * 0.9 and not getattr(self, '_budget_warned', False):
                 self._budget_warned = True
@@ -354,7 +469,7 @@ class WorkerAgent:
                 })
                 await logger.warning(
                     "worker.token_budget_warning",
-                    agent=self.name,
+                    agent_name=self.name,
                     tokens=used,
                     budget=budget,
                 )
@@ -363,7 +478,7 @@ class WorkerAgent:
             if used > budget:
                 await logger.warning(
                     "worker.token_budget_exceeded",
-                    agent=self.name,
+                    agent_name=self.name,
                     tokens=used,
                     budget=budget,
                 )
@@ -443,7 +558,7 @@ class WorkerAgent:
                 error_str = str(exc)
                 await logger.error(
                     "worker.llm_error",
-                    agent=self.name,
+                    agent_name=self.name,
                     iteration=self._iteration,
                     error=error_str,
                     consecutive_errors=consecutive_errors,
@@ -465,7 +580,7 @@ class WorkerAgent:
                     )
                     await logger.warning(
                         "worker.too_many_errors",
-                        agent=self.name,
+                        agent_name=self.name,
                         consecutive_errors=consecutive_errors,
                     )
                     break
@@ -498,8 +613,22 @@ class WorkerAgent:
             if not response.choices:
                 await logger.warning(
                     "worker.empty_choices",
-                    agent=self.name,
+                    agent_name=self.name,
                     iteration=self._iteration,
+                )
+                # V2.6: Record empty_choices to ledger so it shows in replay
+                self._ledger.record_llm_call(
+                    agent=self.name,
+                    model=self._config.model,
+                    messages=self._messages,
+                    response_text="[EMPTY_CHOICES]",
+                    tool_calls=None,
+                    prompt_tokens=self._last_prompt_tokens,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    cumulative_tokens=self._total_tokens.total_tokens,
+                    iteration=self._iteration,
+                    wall_clock_ms=round((time.monotonic() - _call_start) * 1000, 1) if '_call_start' in dir() else 0,
                 )
                 consecutive_errors += 1
                 continue
@@ -537,7 +666,7 @@ class WorkerAgent:
                     except Exception as tool_exc:
                         await logger.error(
                             "worker.tool_call_crashed",
-                            agent=self.name,
+                            agent_name=self.name,
                             tool=getattr(tool_call.function, 'name', 'unknown'),
                             error=str(tool_exc),
                         )
@@ -575,7 +704,7 @@ class WorkerAgent:
                     summary = content
                     await logger.info(
                         "worker.task_complete_with_tools",
-                        agent=self.name,
+                        agent_name=self.name,
                         iteration=self._iteration,
                     )
                     break
@@ -593,13 +722,74 @@ class WorkerAgent:
                         "content": "Files written. If your task is complete, respond only with '[TASK_COMPLETE]' and a one-line summary.",
                     })
 
-                # Log to state
+                # --- V2.6: Re-inject task after heavy reads ---
+                # If agent did 3+ read_file calls without any writes this iteration,
+                # re-state the original task to prevent context drift / hallucination.
+                _read_count = sum(
+                    1 for tc in message.tool_calls
+                    if hasattr(tc, 'function') and tc.function.name == 'read_file'
+                )
+                _write_count = sum(
+                    1 for tc in message.tool_calls
+                    if hasattr(tc, 'function') and tc.function.name in ('write_file', 'run_command')
+                )
+                if _read_count >= 3 and _write_count == 0 and hasattr(self, '_original_task'):
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            f"REMINDER — Your task is:\n{self._original_task}\n\n"
+                            f"You now have enough context. Write the required files."
+                        ),
+                    })
+
+                # Log to state — include tool names & files for LTM extraction
+                _tool_summary_parts = []
+                for tc in message.tool_calls:
+                    if hasattr(tc, 'function'):
+                        fn = tc.function.name
+                        try:
+                            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                        except Exception:
+                            args = {}
+                        path = args.get("path", "")
+                        _tool_summary_parts.append(f"{fn}: {path}" if path else fn)
+                _tool_summary = ", ".join(_tool_summary_parts[:5])  # Cap at 5 tools
                 await self._state.add_message(
                     role=MessageRole.AGENT,
                     sender=self.name,
                     recipient="orchestrator",
-                    content=f"[Tool calls: {len(message.tool_calls)}]",
+                    content=f"[{_tool_summary}]",
                 )
+
+                # --- V2.6: Read-loop breaker ---
+                # If agent has done 3+ consecutive iterations of only reads
+                # (no writes, no commands), inject a strong nudge to start writing.
+                _any_writes = any(
+                    tc.function.name in ("write_file", "run_command")
+                    for tc in message.tool_calls
+                    if hasattr(tc, 'function')
+                )
+                if _any_writes:
+                    self._consecutive_read_iters = 0
+                else:
+                    self._consecutive_read_iters += 1
+
+                if self._consecutive_read_iters >= 3:
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM WARNING: You have spent 3+ iterations only "
+                            "reading files without writing any output. "
+                            "STOP READING. You have enough context. "
+                            "Write your files NOW using write_file, "
+                            "then respond with '[TASK_COMPLETE]'."
+                        ),
+                    })
+                    await logger.warning(
+                        "worker.read_loop_breaker",
+                        agent_name=self.name,
+                        consecutive_reads=self._consecutive_read_iters,
+                    )
 
                 continue
 
@@ -618,7 +808,7 @@ class WorkerAgent:
                 summary = content
                 await logger.info(
                     "worker.task_complete",
-                    agent=self.name,
+                    agent_name=self.name,
                     iteration=self._iteration,
                 )
                 break
@@ -638,6 +828,15 @@ class WorkerAgent:
 
         if not summary:
             summary = f"Agent reached iteration limit ({self._config.max_iterations})."
+
+        # V2.7: Log compliance report
+        if hasattr(self._executor, 'get_compliance_report'):
+            report = self._executor.get_compliance_report()
+            await logger.info(
+                "worker.compliance_report",
+                agent_name=self.name,
+                **report,
+            )
 
         return summary
 
@@ -693,7 +892,7 @@ class WorkerAgent:
 
         await logger.info(
             "worker.tool_call",
-            agent=self.name,
+            agent_name=self.name,
             tool=tool_name,
             args_preview=str(arguments)[:200],
         )
@@ -711,6 +910,28 @@ class WorkerAgent:
         result = await self._executor.execute(tool_name, arguments)
         _tool_duration = (time.monotonic() - _tool_start) * 1000
         self._tool_count += 1
+
+        # V2.5: Circuit breaker for consecutive run_command failures
+        if tool_name == "run_command":
+            if not result.success:
+                self._consecutive_cmd_failures += 1
+                if self._consecutive_cmd_failures >= 3:
+                    self._messages.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM: run_command has failed 3+ times consecutively. "
+                            "Command execution may be restricted in this environment. "
+                            "Complete your task using only read_file and write_file tools. "
+                            "Do NOT retry commands."
+                        ),
+                    })
+                    await logger.warning(
+                        "worker.cmd_circuit_breaker",
+                        agent_name=self.name,
+                        failures=self._consecutive_cmd_failures,
+                    )
+            else:
+                self._consecutive_cmd_failures = 0  # Reset on success
 
         # V2: Truncate error tracebacks to save tokens (max 300 chars)
         _error_str = result.error or ""
@@ -815,7 +1036,7 @@ class WorkerAgent:
             await self._interrupts.push(context)
             await logger.info(
                 "worker.interrupt_received",
-                agent=self.name,
+                agent_name=self.name,
                 file=file_path,
             )
 
@@ -851,7 +1072,7 @@ class WorkerAgent:
 
         await logger.info(
             "worker.interrupts_injected",
-            agent=self.name,
+            agent_name=self.name,
             count=len(contexts),
         )
 
@@ -859,8 +1080,8 @@ class WorkerAgent:
     # Algorithmic Sliding Window (V2 — zero-cost, no LLM)
     # -------------------------------------------------------------------
 
-    _WINDOW_KEEP_RECENT_PAIRS = 2     # assistant+tool pairs to keep in full (V2.1: was 4, too generous)
-    _WINDOW_TRIGGER_TOKENS = 1_500    # start windowing above this (V2.1: was 2,500, too late)
+    _WINDOW_KEEP_RECENT_PAIRS = 3     # V2.6: was 2, too aggressive — caused context amnesia and hallucination
+    _WINDOW_TRIGGER_TOKENS = 3_000    # start windowing above this (V2.5: was 1,500 — too aggressive, caused context amnesia)
     _STUB_MAX_CHARS = 50              # max chars for stubbed old messages
 
     async def _apply_sliding_window(self) -> None:
@@ -978,7 +1199,7 @@ class WorkerAgent:
 
         await logger.info(
             "worker.sliding_window_applied",
-            agent=self.name,
+            agent_name=self.name,
             actual_prompt_tokens=actual,
             messages_before=msgs_before,
             messages_after=len(self._messages),
@@ -987,11 +1208,19 @@ class WorkerAgent:
         )
 
         # --- Session Ledger ---
+        # Estimate post-compression tokens from the rebuilt message list
+        compressed_tokens = sum(
+            len(m.get("content", "").split()) * 1.3  # rough token estimate
+            for m in self._messages
+        )
+        compressed_tokens = int(compressed_tokens)
+        ratio = compressed_tokens / max(actual, 1)
+
         self._ledger.record_compression(
             agent=self.name,
             original_tokens=actual,
-            compressed_tokens=0,  # No LLM used — zero cost
-            ratio=0.0,
+            compressed_tokens=compressed_tokens,
+            ratio=round(ratio, 3),
             messages_before=msgs_before,
             messages_after=len(self._messages),
         )

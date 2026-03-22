@@ -408,8 +408,9 @@ class EventBus:
         await bus.disconnect()
     """
 
-    def __init__(self, config: EventBusConfig) -> None:
+    def __init__(self, config: EventBusConfig, *, tenant_id: str = "") -> None:
         self._config = config
+        self._tenant_id = tenant_id
         self._redis: Any | None = None
         self._pubsub: Any | None = None
         self._stream_handlers: dict[str, list[EventHandler]] = {}
@@ -476,8 +477,15 @@ class EventBus:
     # -------------------------------------------------------------------
 
     def _stream_key(self, channel: str) -> str:
-        """Build a Redis Stream key from a channel name."""
-        return f"{self._config.stream_prefix}:{channel}"
+        """Build a Redis Stream key from a channel name.
+
+        V2.5: If tenant_id is set, keys are prefixed for isolation:
+        ``tenant-{id}:swarm:{channel}`` instead of ``swarm:{channel}``.
+        """
+        prefix = self._config.stream_prefix
+        if self._tenant_id:
+            prefix = f"tenant-{self._tenant_id}:{prefix}"
+        return f"{prefix}:{channel}"
 
     async def publish(self, channel: str, event: SwarmEvent) -> str | None:
         """Publish an event to a Redis Stream.
@@ -653,7 +661,10 @@ class EventBus:
 
     def _pubsub_channel(self, channel: str) -> str:
         """Build a Redis Pub/Sub channel name."""
-        return f"{self._config.stream_prefix}:pubsub:{channel}"
+        prefix = self._config.stream_prefix
+        if self._tenant_id:
+            prefix = f"tenant-{self._tenant_id}:{prefix}"
+        return f"{prefix}:pubsub:{channel}"
 
     async def broadcast(self, channel: str, event: SwarmEvent) -> int:
         """Broadcast an event via Redis Pub/Sub.

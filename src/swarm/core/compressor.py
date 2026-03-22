@@ -218,6 +218,14 @@ class Compressor:
         self._store_path.mkdir(parents=True, exist_ok=True)
         (self._store_path / "raw").mkdir(exist_ok=True)
 
+        # Only connect LanceDB if backend is explicitly 'lancedb'
+        if self._mem_cfg.backend != "lancedb":
+            await logger.info(
+                "compressor.using_json_backend",
+                msg="Using JSON keyword search (no embedding model needed).",
+            )
+            return
+
         try:
             import lancedb
 
@@ -405,18 +413,27 @@ class Compressor:
             )
 
         # --- Pre-flight heuristic: skip trivial tasks ---
-        # A task is trivial when the conversation is short, error-free, and
-        # consumed minimal tokens. Extracting knowledge from these wastes ~4k
-        # tokens per invocation on zero-value entries.
+        # Only skip truly empty tasks (e.g. failed dispatches with no work).
+        # Lower threshold to ensure most tasks generate memories.
         total_msg_tokens = sum(
             len(m.get("content", "").split()) * 1.3  # rough token estimate
             for m in conversation_history
         )
         is_trivial = (
-            len(conversation_history) <= 5
+            len(conversation_history) <= 2
             and not task_errors
-            and total_msg_tokens < 5_000
+            and total_msg_tokens < 1_000
         )
+
+        await logger.info(
+            "compressor.extraction_decision",
+            agent=agent_name,
+            task=task_name,
+            messages=len(conversation_history),
+            estimated_tokens=int(total_msg_tokens),
+            is_trivial=is_trivial,
+        )
+
         if is_trivial:
             await logger.info(
                 "compressor.extraction_skipped",
@@ -660,7 +677,12 @@ CONVERSATION HISTORY:
                 table = self._db.open_table(table_name)
                 table.add([record])
             else:
-                self._db.create_table(table_name, [record])
+                try:
+                    self._db.create_table(table_name, [record])
+                except Exception:
+                    # Table was created between check and create (race condition)
+                    table = self._db.open_table(table_name)
+                    table.add([record])
 
             await logger.info(
                 "compressor.vector_persisted",
@@ -703,16 +725,49 @@ CONVERSATION HISTORY:
             Matching memories ranked by relevance.
         """
         if not self._mem_cfg.enabled:
+            await logger.info("compressor.memory_disabled", msg="Memory system is disabled in config")
             return []
 
         max_results = limit or self._mem_cfg.max_retrieval_results
+        search_method = "vector" if self._db is not None else "json_fallback"
+
+        await logger.info(
+            "compressor.memory_search_start",
+            query=query[:100],
+            method=search_method,
+            limit=max_results,
+            category_filter=category or "all",
+        )
 
         # Try vector search first
         if self._db is not None:
-            return await self._search_vector(query, category=category, limit=max_results)
+            results = await self._search_vector(query, category=category, limit=max_results)
+        else:
+            # Fallback to JSON search (keyword-based)
+            results = await self._search_json_fallback(query, category=category, limit=max_results)
 
-        # Fallback to JSON search (keyword-based)
-        return await self._search_json_fallback(query, category=category, limit=max_results)
+        # Log results
+        if results:
+            for i, mem in enumerate(results):
+                await logger.info(
+                    "compressor.memory_found",
+                    rank=i + 1,
+                    category=mem.category,
+                    title=mem.title[:80],
+                    confidence=mem.confidence,
+                    source_agent=mem.source_agent,
+                    source_task=mem.source_task[:60] if mem.source_task else "",
+                    content_preview=mem.content[:100],
+                )
+        else:
+            await logger.info(
+                "compressor.memory_search_empty",
+                query=query[:80],
+                method=search_method,
+                msg="No matching memories found. Memory store may be empty.",
+            )
+
+        return results
 
     async def _search_vector(
         self,
@@ -734,20 +789,23 @@ CONVERSATION HISTORY:
             for table_name in tables_to_search:
                 try:
                     table = self._db.open_table(table_name)
-                    search_results = (
+                    # Use to_arrow() instead of to_pandas() (pandas not installed)
+                    arrow_table = (
                         table.search(query_embedding)
                         .limit(limit)
-                        .to_pandas()
+                        .to_arrow()
                     )
+                    rows = arrow_table.to_pydict()
+                    num_rows = arrow_table.num_rows
 
-                    for _, row in search_results.iterrows():
+                    for i in range(num_rows):
                         # LanceDB returns _distance (lower = more similar)
-                        distance = row.get("_distance", 1.0)
+                        distance = rows.get("_distance", [1.0] * num_rows)[i]
                         # Convert distance to similarity (cosine distance → similarity)
                         similarity = 1.0 - min(distance, 1.0)
 
                         if similarity >= self._mem_cfg.relevance_threshold:
-                            tags = row.get("tags", "[]")
+                            tags = rows.get("tags", ["[]"] * num_rows)[i]
                             if isinstance(tags, str):
                                 try:
                                     tags = json.loads(tags)
@@ -755,15 +813,15 @@ CONVERSATION HISTORY:
                                     tags = []
 
                             results.append(MemoryEntry(
-                                memory_id=row["memory_id"],
-                                category=row["category"],
-                                title=row["title"],
-                                content=row["content"],
+                                memory_id=rows["memory_id"][i],
+                                category=rows["category"][i],
+                                title=rows["title"][i],
+                                content=rows["content"][i],
                                 tags=tags,
-                                source_task=row.get("source_task", ""),
-                                source_agent=row.get("source_agent", ""),
-                                created_at=row.get("created_at", ""),
-                                confidence=row.get("confidence", 0.8),
+                                source_task=rows.get("source_task", [""] * num_rows)[i],
+                                source_agent=rows.get("source_agent", [""] * num_rows)[i],
+                                created_at=rows.get("created_at", [""] * num_rows)[i],
+                                confidence=rows.get("confidence", [0.8] * num_rows)[i],
                             ))
                 except Exception as exc:
                     await logger.warning(

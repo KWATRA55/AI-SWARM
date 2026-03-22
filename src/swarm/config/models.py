@@ -275,7 +275,7 @@ class MemoryConfig(BaseModel):
         description="Vector store backend: 'lancedb' (local, zero-config).",
     )
     embedding_model: str = Field(
-        default="gemini/text-embedding-005",
+        default="gemini/text-embedding-004",
         description=(
             "litellm-compatible embedding model for vectorising memories. "
             "Used for similarity search during retrieval."
@@ -416,6 +416,114 @@ class RateLimitConfig(BaseModel):
         le=1.0,
         description="Use only this fraction of the limit (0.85 = leave 15%% headroom).",
     )
+
+
+class TenantConfig(BaseModel):
+    """Multi-tenant isolation settings."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str = Field(
+        default="default",
+        description="Unique tenant identifier. All data is partitioned by this.",
+    )
+    org_id: str = Field(
+        default="default",
+        description="Organisation the tenant belongs to.",
+    )
+    data_root: Path = Field(
+        default=Path.home() / ".swarm" / "data",
+        description="Root directory for tenant data storage.",
+    )
+
+
+class WebScraperConfig(BaseModel):
+    """Secure web scraper tool configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=False)
+    url_whitelist: list[str] = Field(
+        default_factory=list,
+        description="Allowed URL patterns (glob). Empty = allow all public URLs.",
+    )
+    max_response_bytes: int = Field(
+        default=512_000,
+        ge=1_000,
+        description="Maximum response size in bytes (default 500KB).",
+    )
+    timeout_seconds: int = Field(default=30, ge=5, le=120)
+    blocked_domains: list[str] = Field(
+        default_factory=lambda: ["localhost", "127.0.0.1", "0.0.0.0", "169.254.*", "10.*"],
+        description="Blocked domains/IPs (internal network protection).",
+    )
+
+
+class SQLConfig(BaseModel):
+    """Read-only SQL query tool configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=False)
+    connections: dict[str, str] = Field(
+        default_factory=dict,
+        description="Named DB connections: alias → connection string.",
+    )
+    read_only: bool = Field(
+        default=True,
+        description="Enforce read-only queries (block DDL/DML).",
+    )
+    max_rows: int = Field(default=100, ge=1, le=1000)
+    query_timeout_seconds: int = Field(default=30, ge=5)
+
+
+class WebhookConfig(BaseModel):
+    """Outbound webhook tool configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=False)
+    url_whitelist: list[str] = Field(
+        default_factory=list,
+        description="Allowed webhook URLs.",
+    )
+    max_payload_bytes: int = Field(default=10_240, ge=100)
+    timeout_seconds: int = Field(default=30, ge=5, le=120)
+
+
+class HITLConfig(BaseModel):
+    """Human-in-the-loop checkpoint configuration."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable HITL checkpoints.",
+    )
+    default_timeout_minutes: int = Field(
+        default=30,
+        ge=1,
+        description="Minutes to wait for human approval before timing out.",
+    )
+    auto_approve_after: int = Field(
+        default=0,
+        ge=0,
+        description="Auto-approve checkpoints after N minutes (0 = never).",
+    )
+    notify_channel: str = Field(
+        default="",
+        description="Optional webhook URL for checkpoint notifications.",
+    )
+
+
+class ToolsConfig(BaseModel):
+    """Configuration for extended MCP tools."""
+
+    model_config = ConfigDict(frozen=True)
+
+    web_scraper: WebScraperConfig = Field(default_factory=WebScraperConfig)
+    sql: SQLConfig = Field(default_factory=SQLConfig)
+    webhook: WebhookConfig = Field(default_factory=WebhookConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +687,11 @@ class SwarmConfig(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     rate_limits: RateLimitConfig = Field(default_factory=RateLimitConfig)
+
+    # --- Phase 2–5 enterprise features ---
+    tenant: TenantConfig = Field(default_factory=TenantConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    hitl: HITLConfig = Field(default_factory=HITLConfig)
 
     # --- Telemetry ---
     enable_session_replay: bool = Field(

@@ -318,6 +318,11 @@ class SwarmOrchestrator:
         )
 
         try:
+            # --- Phase 0: Reset cross-agent session state ---
+            # Clear file ownership registry + shared cache from previous session
+            from swarm.core.compliance import ToolComplianceProxy
+            ToolComplianceProxy.reset_session_state()
+
             # --- Phase 1: Initialise infrastructure ---
             await self._initialize_infrastructure()
 
@@ -689,6 +694,7 @@ class SwarmOrchestrator:
                 agent_config=agent_config,
                 enhanced_prompt=enhanced_prompt,
                 task_id=task_id,
+                task_prompt=task or "",
             )
 
             # --- 5. Record results ---
@@ -774,6 +780,7 @@ class SwarmOrchestrator:
         agent_config: AgentConfig,
         enhanced_prompt: str,
         task_id: str,
+        task_prompt: str = "",
     ) -> dict[str, Any]:
         """Run the core agentic LLM loop for a single agent.
 
@@ -844,7 +851,7 @@ class SwarmOrchestrator:
         # --- Execute ---
         try:
             return await agent.execute(
-                task=task_id,
+                task=task_prompt or enhanced_prompt,  # Use raw task text for memory search
                 task_id=task_id,
                 enhanced_prompt=enhanced_prompt,
             )
@@ -960,11 +967,13 @@ class SwarmOrchestrator:
                     lines.append(f"{sub_indent}{file}")
                     file_count += 1
 
-            if file_count > 100:
-                lines.append('  ... (truncated at 100 files)')
+            if file_count > 50:
                 break
 
-        return '\n'.join(lines) if lines else '(empty workspace)'
+        if lines:
+            lines.append("\n[Directory tree truncated. Use 'list_directory' tool to explore further.]")
+            return '\n'.join(lines)
+        return '(empty workspace)'
 
     async def _dispatch_helper_agent(
         self,
@@ -1045,6 +1054,7 @@ class SwarmOrchestrator:
                 agent_config=idle_config,
                 enhanced_prompt=enhanced_prompt,
                 task_id=f"helper-{idle_agent}-for-{struggling_agent}",
+                task_prompt=help_context + struggling_context,
             )
             await logger.info(
                 "orchestrator.helper_completed",
@@ -1095,10 +1105,12 @@ class SwarmOrchestrator:
             if agent_config.name not in self._paused_agents:
                 self._paused_agents[agent_config.name] = asyncio.Event()
 
-        # Flush telemetry ledger so logs are preserved
+        # Flush telemetry ledger so logs are preserved (but keep handle open!)
+        # V2.4 FIX: Previously called close() which permanently killed the
+        # file handle, causing all subsequent iterations to go unrecorded.
         if hasattr(self, '_ledger') and self._ledger is not None:
             try:
-                self._ledger.close()
+                self._ledger.flush()
             except Exception:
                 pass
 
@@ -1186,12 +1198,50 @@ class SwarmOrchestrator:
                 agent_config=capped_config,
                 enhanced_prompt=enhanced_prompt,
                 task_id=f"dynamic-{agent_name}-{int(time.time())}",
+                task_prompt=task_prompt,
             )
             # Mark agent as completed so the Manager stops watching it
             try:
                 await self._state.set_agent_status(agent_name, AgentStatus.COMPLETED)
             except Exception:
                 pass
+
+            # Phase 5: Extract long-term memories directly from the result
+            # (Dynamic tasks don't have task status = COMPLETED in state,
+            #  so _post_execution_extraction() would find nothing.)
+            try:
+                # Get messages stored in state for this agent
+                messages = await self._state.get_messages(
+                    sender=agent_name,
+                )
+                conversation_history = [
+                    {"role": m.role.value, "content": m.content}
+                    for m in messages
+                ]
+
+                # Use the result summary as task_result
+                task_result = result.get("summary", "") if isinstance(result, dict) else str(result)
+
+                extraction = await self._compressor.extract_knowledge(
+                    task_name=f"{agent_name}: {task_prompt[:100]}",
+                    agent_name=agent_name,
+                    conversation_history=conversation_history,
+                    task_result=task_result[:2000],
+                )
+
+                await logger.info(
+                    "orchestrator.dynamic_ltm_extracted",
+                    agent=agent_name,
+                    entries=len(extraction.entries) if extraction.entries else 0,
+                    messages_used=len(conversation_history),
+                )
+            except Exception as ltm_exc:
+                await logger.warning(
+                    "orchestrator.dynamic_ltm_extraction_failed",
+                    agent=agent_name,
+                    error=str(ltm_exc)[:200],
+                )
+
             await self._broadcast("dynamic_task_completed", {
                 "agent": agent_name,
                 "status": result.get("status", "unknown"),
@@ -1217,9 +1267,20 @@ class SwarmOrchestrator:
     async def _post_execution_extraction(self) -> None:
         """Extract long-term memories from all completed tasks."""
         if not self._config.memory.enabled or not self._config.memory.auto_extract:
+            await logger.info("orchestrator.ltm_skip", reason="memory disabled or auto_extract off")
             return
 
         completed_tasks = await self._state.get_tasks_by_status(TaskStatus.COMPLETED)
+
+        await logger.info(
+            "orchestrator.ltm_extraction_start",
+            completed_tasks=len(completed_tasks),
+            task_names=[t.name for t in completed_tasks],
+        )
+
+        if not completed_tasks:
+            await logger.info("orchestrator.ltm_no_completed_tasks")
+            return
 
         for task_record in completed_tasks:
             # Get the agent's message history
@@ -1231,12 +1292,27 @@ class SwarmOrchestrator:
                 for m in messages
             ]
 
+            await logger.info(
+                "orchestrator.ltm_extracting",
+                task=task_record.name,
+                agent=task_record.assigned_agent,
+                messages_in_state=len(conversation_history),
+                total_content_len=sum(len(m.get("content", "")) for m in conversation_history),
+            )
+
             try:
                 extraction = await self._compressor.extract_knowledge(
                     task_name=task_record.name,
                     agent_name=task_record.assigned_agent,
                     conversation_history=conversation_history,
                     task_result=task_record.result or "",
+                )
+
+                await logger.info(
+                    "orchestrator.ltm_extraction_result",
+                    task=task_record.name,
+                    entries=len(extraction.entries),
+                    time_seconds=round(extraction.extraction_time_seconds, 2),
                 )
 
                 if extraction.entries:

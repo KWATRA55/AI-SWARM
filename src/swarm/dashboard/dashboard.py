@@ -83,6 +83,14 @@ class SwarmDashboard:
         """Build the FastAPI application."""
         app = FastAPI(title="🐝 Swarm Dashboard", version="2.0.0")
 
+        # ── Aegis Security Middleware ──
+        try:
+            from swarm.api.middleware import RateLimitMiddleware, RequestLoggingMiddleware
+            app.add_middleware(RateLimitMiddleware, requests_per_minute=120)
+            app.add_middleware(RequestLoggingMiddleware)
+        except ImportError:
+            pass  # Middleware not available — skip
+
         # ── Core endpoints ──
 
         @app.get("/", response_class=HTMLResponse)
@@ -104,6 +112,9 @@ class SwarmDashboard:
                     except json.JSONDecodeError:
                         pass
             except WebSocketDisconnect:
+                pass
+            except RuntimeError:
+                # Client disconnected mid-operation (e.g., test harness closing WS)
                 pass
             finally:
                 if ws in self._clients:
@@ -252,6 +263,14 @@ class SwarmDashboard:
         if len(self._event_buffer) > self._max_buffer:
             self._event_buffer = self._event_buffer[-self._max_buffer:]
 
+        # V2.6 → Aegis: Track file writes for manager's review_agent_output tool
+        # Worker broadcasts event_type='file_write' with data={'agent':..., 'file':...}
+        if event_type == "file_write":
+            agent = data.get("agent", source)
+            file_path = data.get("file", "")  # worker uses 'file', not 'file_path'
+            if self._manager_chat and file_path:
+                self._manager_chat.record_file_write(agent, file_path)
+
         disconnected = []
         for ws in self._clients:
             try:
@@ -380,6 +399,7 @@ class SwarmDashboard:
                 dashboard_cb=self.broadcast_event,
                 state=state,
                 ledger=ledger,
+                config=self._orchestrator._config if self._orchestrator else None,
             )
 
         # Send typing indicator

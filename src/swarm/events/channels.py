@@ -76,6 +76,13 @@ class StreamChannel(str, Enum):
     MEMORY_EXTRACTED = "memory_extracted"
     """New knowledge has been extracted to long-term memory."""
 
+    # --- HITL checkpoints ---
+    HITL_CHECKPOINT_CREATED = "hitl_checkpoint_created"
+    """An agent has requested human approval at a checkpoint."""
+
+    HITL_CHECKPOINT_RESOLVED = "hitl_checkpoint_resolved"
+    """A HITL checkpoint has been approved or rejected."""
+
 
 class BroadcastChannel(str, Enum):
     """Real-time Pub/Sub channels for interrupt-style notifications.
@@ -116,6 +123,12 @@ class BroadcastChannel(str, Enum):
 
     Used when the compressor produces a new summary or when LTM
     retrieves relevant memories mid-execution.
+    """
+
+    HITL_APPROVAL_NEEDED = "hitl_approval_needed"
+    """Broadcast: an agent is waiting for human approval at a checkpoint.
+
+    Dashboard should show this immediately to the user.
     """
 
 

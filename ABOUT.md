@@ -33,7 +33,10 @@ AI Swarm is a **multi-agent orchestration platform** that coordinates a team of 
 - **DAG-based execution** — Agents run in tiers based on dependency ordering (architect → devs → QA)
 - **Shared workspace** — All agents write to the same directory with Redis-backed file locking
 - **Interactive mode** — Agents wait for human direction via a real-time dashboard chat
-- **Memory system** — LanceDB vector store for cross-session learning (skills, bugs, patterns)
+- **Memory system** — JSON keyword search + optional LanceDB vectors for cross-session learning
+- **Cross-agent memory** — Agents recall knowledge from past sessions (skills, patterns, solutions)
+- **File ownership** — Deconfliction ensures no two agents write the same file simultaneously
+- **Session telemetry** — Full event replay (LLM calls, tool executions, memory searches, compressions)
 
 ---
 
@@ -102,17 +105,26 @@ src/swarm/
 │   ├── orchestrator.py       # Main engine — DAG resolution, tier exec, dispatch
 │   ├── state.py              # SwarmState — async-safe state container
 │   ├── manager.py            # SwarmManager — watchdog, stall detection, nudging
-│   ├── manager_chat.py       # ManagerChat — LLM-backed chat interface
-│   └── compressor.py         # Context compression + LTM extraction engine
+│   ├── manager_chat.py       # ManagerChat — 8-tool LLM chat with dispatch guard
+│   ├── compressor.py         # Context compression + LTM extraction + memory search
+│   ├── telemetry.py          # SessionLedger — structured event replay logging
+│   ├── llm_gateway.py        # LLM routing with per-agent tracking + fallback
+│   ├── compliance.py         # Write compliance reports per agent
+│   ├── circuit_breaker.py    # Cross-agent loop detection + cooldown
+│   └── hitl.py               # Human-in-the-loop approval queue
 ├── agents/
-│   └── worker.py             # WorkerAgent — the core agentic LLM loop
+│   └── worker.py             # WorkerAgent — agentic loop + proactive memory search
 ├── events/
 │   ├── bus.py                # Redis event bus (streams, pub/sub, file locks)
-│   └── channels.py           # Channel name enums
+│   └── channels.py           # Channel name enums + file write completion channel
 ├── mcp/
-│   └── tools.py              # ToolExecutor — read_file, write_file, run_command, etc.
+│   ├── tools.py              # ToolExecutor — read_file, write_file, run_command, etc.
+│   ├── tools_web.py          # Web search + URL scraping tools
+│   ├── tools_sql.py          # SQL query execution tool
+│   ├── tools_hitl.py         # Human approval tool
+│   └── tools_webhook.py      # Webhook dispatch tool
 ├── dashboard/
-│   ├── dashboard.py          # FastAPI app + WebSocket server
+│   ├── dashboard.py          # FastAPI + WebSocket + disconnect handling
 │   └── static/index.html     # Single-page dashboard UI
 ├── sandbox/
 │   └── manager.py            # Docker sandbox manager (container lifecycle)
@@ -161,23 +173,29 @@ The brain of the system. Key responsibilities:
 | `dispatch_dynamic_task()` | Chat-driven task dispatch (capped at 15 iter) |
 | `_dispatch_helper_agent()` | Re-dispatch a completed agent to help a struggling one |
 | `_build_enhanced_prompt()` | Inject workspace context + LTM memories into system prompt |
-| `_post_execution_extraction()` | Extract knowledge after task completion |
+| `_post_execution_extraction()` | Extract knowledge after task completion (DAG mode) |
+| Direct `extract_knowledge()` | Extract knowledge for dynamic dispatch (bypasses state query) |
 
 ### 2. Worker Agent (`agents/worker.py`)
 
 The agentic execution loop. Each agent:
 
-1. Receives an enhanced system prompt (with LTM context)
-2. Enters a `while iteration < max_iterations` loop
-3. Calls the LLM with the accumulated message history + tools
-4. If LLM returns **tool_calls** → executes them via ToolExecutor, appends results
-5. If LLM returns **text with `[TASK_COMPLETE]`** → breaks and returns
-6. If LLM returns **text without completion signal** → appends "Continue" prompt
-7. Budget enforced: breaks if `total_tokens > 50,000`
+1. **Proactive memory search** — Before first iteration, searches LTM for relevant memories and injects as `MEMORY CONTEXT (from past sessions)` block
+2. Receives an enhanced system prompt (with LTM context)
+3. Enters a `while iteration < max_iterations` loop
+4. Calls the LLM with the accumulated message history + tools
+5. If LLM returns **tool_calls** → executes them via ToolExecutor, appends results
+6. If LLM returns **text with `[TASK_COMPLETE]`** → breaks and returns
+7. If LLM returns **text without completion signal** → appends "Continue" prompt
+8. Budget enforced: breaks if `total_tokens > 50,000`
+
+**Enriched state messages:** Tool call summaries include tool names and file paths (e.g., `[write_file: app/models.py, read_file: ARCHITECTURE.md]`) instead of generic counts, providing richer context for LTM extraction.
 
 **Interrupt system:** A parallel async task monitors the EventBus for schema changes. When triggered, the interrupt context is injected into the message history, forcing the agent to re-evaluate.
 
 **Context compression:** When message history exceeds the token threshold (default 16k), the Compressor summarizes old messages via a fast LLM (Gemini Flash), archives the originals in Redis.
+
+**Compliance report:** After completion, emits a structured report with files written, reads, cache hits, tokens saved, hallucination count, and blocked calls.
 
 ### 3. SwarmState (`core/state.py`)
 
@@ -208,20 +226,27 @@ Background watchdog loop running every 10 seconds:
 
 ### 5. Manager Chat (`core/manager_chat.py`)
 
-LLM-powered chat interface on the dashboard:
+LLM-powered chat interface on the dashboard (v2.6):
 
 - **Model**: Gemini 2.5 Pro (configurable)
-- **Tools available to the Manager LLM**:
+- **8 smart tools** available to the Manager LLM:
   - `read_file` — read any workspace file
   - `list_directory` — browse project structure
-  - `dispatch_task` — assign work to any agent
+  - `dispatch_task` — assign work to any agent (with target_files)
+  - `redispatch_task` — reassign failed tasks to a different agent
   - `get_agent_status` — query live agent status from SwarmState
-- **Multi-round tool calling**: The Manager can call multiple tools in one turn (e.g., dispatch 4 agents at once)
+  - `get_session_summary` — session-level metrics and token usage
+  - `get_token_budgets` — check remaining budgets before dispatching
+  - `review_agent_output` — read files an agent wrote + task context
+- **Intent guard**: Classifies user messages as STATUS/ACTION/REVIEW/AMBIGUOUS. Only ACTION intent enables `dispatch_task`. Prevents accidental dispatches from questions like "what's happening?"
+- **Post-review dispatch blocking**: After `review_agent_output` executes, `dispatch_task` and `redispatch_task` are removed from available tools for the rest of that chat round — prevents the "perfection loop" where the manager reviews output, finds minor style issues, and keeps redispatching corrections
+- **Multi-round tool calling**: Up to 5 rounds per chat turn (e.g., check status → review output → dispatch)
 - **Proactive reporting**: Auto-broadcasts task dispatch/complete/fail/stall events to the chat
+- **Dispatch rules**: Single file ownership per agent, prefer fewer agents, accept completed work unless actual errors
 
 ### 6. Compressor (`core/compressor.py`)
 
-Dual responsibility:
+Triple responsibility:
 
 **Short-term compression:**
 ```
@@ -231,11 +256,37 @@ Raw content (logs, diffs) → token count check → if > threshold →
 
 **Long-term extraction (after task completion):**
 ```
-Conversation history → extraction LLM → structured JSON →
-  MemoryEntry objects → embed → persist to LanceDB
+Conversation history → extraction LLM (gemini-2.0-flash) → structured JSON →
+  MemoryEntry objects → persist to JSON files (+ optional LanceDB vectors)
+```
+Triviality check: skips extraction for `≤2 messages` or `<1,000 tokens`.
+
+**Memory search (retrieval):**
+```
+Task text → keyword term matching against raw JSON title+content →
+  ranked by match score → top results injected as MEMORY CONTEXT
 ```
 
+**Dual backend:**
+- `json` (default) — keyword search from raw JSON files, no embedding model needed
+- `lancedb` — vector similarity search using embeddings (requires working embedding model)
+
 Categories: `skills`, `bugs`, `rules`, `preferences`, `patterns`
+
+### 7. Session Telemetry (`core/telemetry.py`)
+
+Structured event replay logging via `SessionLedger`:
+
+| Event Type | Fields |
+|------------|--------|
+| `llm_call` | agent, model, iteration, tokens (prompt/completion/cumulative), tool_calls_requested |
+| `tool_execution` | agent, tool_name, arguments_preview, success, result_preview, duration_ms |
+| `memory_search` | agent, query, results_count, top_similarity |
+| `routing_decision` | target_agent, task_preview |
+| `compression` | agent, messages_before/after, original/compressed tokens, ratio |
+| `dropped_message` | agent, role, reason, content_preview |
+
+Events are saved as JSONL files (`session_replay_*.jsonl`) for post-hoc analysis.
 
 ---
 
@@ -263,7 +314,8 @@ event_bus:
 memory:
   enabled: true
   auto_extract: true
-  storage_dir: ".swarm_memory"   # LanceDB + raw JSON
+  storage_dir: ".swarm_memory"   # JSON + optional LanceDB
+  backend: "json"                # "json" (keyword search) or "lancedb" (vector search)
 
 compression:
   token_threshold: 16000         # Compress context above this
@@ -338,26 +390,60 @@ Agent B writes foo.py → ACQUIRE (blocked) → wait → (granted after A releas
 
 ---
 
+## Deconfliction & File Ownership
+
+Prevents two agents from writing the same file:
+
+| Layer | Mechanism | Location |
+|-------|-----------|----------|
+| **Redis file locks** | `SET key NX PX timeout` + Lua release script | `events/bus.py` |
+| **File ownership registry** | Tracks which agent owns which file | `orchestrator.py` |
+| **Manager dispatch validation** | Prompt instructs no overlapping target_files | `manager_chat.py` |
+| **Shared file cache** | Cross-agent read cache to avoid redundant reads | `worker.py` |
+
+**Verified:** Zero cross-agent write conflicts across 6 test runs (30+ sessions).
+
+---
+
 ## Long-Term Memory (LTM)
 
 Storage layout:
 ```
 <workspace>/.swarm_memory/
-├── lancedb/          # Vector tables
-│   ├── skills        # Reusable coding patterns
-│   ├── bugs          # Bug resolution records
-│   ├── rules         # Architectural rules
-│   ├── preferences   # Style/tool preferences
-│   └── patterns      # Recurring approaches
-└── raw/              # JSON backup of every entry
+├── lancedb/          # Vector tables (optional, when backend=lancedb)
+│   ├── skills.lance  # Reusable coding patterns
+│   ├── bugs.lance    # Bug resolution records
+│   └── ...           # One table per category
+└── raw/              # JSON files — primary storage
+    ├── skills/       # One .json file per memory entry
+    ├── bugs/
+    ├── rules/
+    ├── preferences/
+    └── patterns/
 ```
 
 **Lifecycle:**
 1. **Boot**: Orchestrator calls `compressor.get_boot_context()` → retrieves relevant memories → injects into agent system prompt
-2. **Runtime**: Agents can call `search_memory` tool to query LTM
-3. **Post-task**: Orchestrator calls `compressor.extract_knowledge()` → LLM extracts structured entries → persisted to LanceDB
+2. **Proactive search**: At the start of each agent iteration, `search_memories(task_text)` runs automatically — results injected as `MEMORY CONTEXT (from past sessions)` block
+3. **Runtime**: Agents can call `search_memory` tool to query LTM on demand
+4. **Post-task (DAG)**: Orchestrator calls `_post_execution_extraction()` → finds completed tasks → extracts knowledge
+5. **Post-task (Dynamic)**: Orchestrator calls `extract_knowledge()` directly with agent results (bypasses state task-status query)
 
-**Search**: Vector similarity (cosine distance) with configurable relevance threshold (default 0.7).
+**Search backends:**
+- `json` (default): Keyword term matching — splits query into terms, matches against title+content+tags of all stored entries. Zero-cost, no embedding model needed.
+- `lancedb`: Vector similarity search (cosine distance) with configurable relevance threshold (default 0.7). Requires a working embedding model.
+
+**Extraction pipeline:**
+```
+Agent completes → extract_knowledge(messages, task_text)
+  → Triviality check (skip if ≤2 msgs or <1k tokens)
+  → LLM extracts structured entries (gemini-2.0-flash)
+  → Each entry: {title, content, category, tags, confidence}
+  → Persisted to raw/{category}/{id}.json
+  → Optionally embedded + stored in LanceDB
+```
+
+**Verified working:** 19 entries stored across multiple sessions. Agents retrieve 3+ relevant memories per query with keyword search.
 
 ---
 

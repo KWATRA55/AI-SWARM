@@ -1,10 +1,11 @@
 """CLI entry point — the ``swarm`` command.
 
-Provides three sub-commands:
+Provides four sub-commands:
 
 * ``swarm validate <config.yaml>`` — Parse and validate a swarm config
   file without running anything.
 * ``swarm run <config.yaml>`` — Execute the full swarm orchestration.
+* ``swarm serve`` — Start the API Gateway server (REST + WebSocket).
 * ``swarm teardown`` — Emergency cleanup of orphaned Docker containers
   and networks from previous sessions.
 
@@ -325,6 +326,79 @@ async def _execute_swarm(
         await logger.info("cli.completed", report=report)
 
         typer.secho("✅ Swarm execution complete", fg=typer.colors.GREEN, bold=True)
+
+
+# ---------------------------------------------------------------------------
+# serve (API Gateway)
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def serve(
+    host: str = typer.Option(
+        "0.0.0.0", "--host", "-h",
+        help="Bind host for the API server.",
+    ),
+    port: int = typer.Option(
+        8000, "--port", "-p",
+        help="Port for the API server.",
+    ),
+    cors_origins: Optional[str] = typer.Option(
+        None, "--cors",
+        help="Comma-separated CORS origins (default: allow all).",
+    ),
+    no_dashboard: bool = typer.Option(
+        False, "--no-dashboard",
+        help="Disable embedding the dashboard UI at /dashboard.",
+    ),
+    reload: bool = typer.Option(
+        False, "--reload",
+        help="Enable auto-reload for development.",
+    ),
+) -> None:
+    """🌐 Start the Swarm API Gateway server.
+
+    Exposes the full swarm control plane as a REST + WebSocket API:
+
+    \b
+    • POST /v1/swarm/dispatch     → Start a swarm run
+    • GET  /v1/swarm/sessions     → List sessions
+    • GET  /v1/health             → Health check
+    • /docs                       → Swagger UI
+
+    API keys are loaded from SWARM_API_KEYS env var.
+    """
+    import uvicorn
+
+    from swarm.infra.env import load_env
+    from swarm.infra.logging import configure_logging
+    from swarm.config.models import LoggingConfig, LogLevel
+
+    # Configure logging
+    configure_logging(LoggingConfig(level=LogLevel.INFO, json_output=False))
+    load_env()
+
+    # Parse CORS origins
+    origins = None
+    if cors_origins:
+        origins = [o.strip() for o in cors_origins.split(",")]
+
+    # Banner
+    typer.secho("🌐 Swarm API Gateway", fg=typer.colors.BRIGHT_CYAN, bold=True)
+    typer.echo(f"   Host:      {host}:{port}")
+    typer.echo(f"   Docs:      http://localhost:{port}/docs")
+    if not no_dashboard:
+        typer.echo(f"   Dashboard: http://localhost:{port}/dashboard")
+    typer.echo()
+
+    uvicorn.run(
+        "swarm.api.gateway:create_app",
+        host=host,
+        port=port,
+        reload=reload,
+        factory=True,
+        log_level="info",
+    )
 
 
 # ---------------------------------------------------------------------------
